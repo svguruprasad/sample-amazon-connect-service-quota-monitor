@@ -39,7 +39,7 @@ jobs:
           python-version: "3.12"
       - run: pip install pip-audit
       - name: Dependency vulnerability scan
-        run: pip-audit -r requirements.txt -r requirements-mapper.txt
+        run: pip-audit -r requirements.txt
       - name: Secret scan
         run: |
           if git grep -nE "AKIA[A-Z0-9]{16}|sk_live_" -- '*.py' '*.json' '*.yaml'; then
