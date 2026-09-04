@@ -743,20 +743,18 @@ def generate_v4_dashboard(
     model: dict[str, Any],
     line_config: dict[str, Any],
     output_path: str,
-    live_endpoint: str | None = None,
 ) -> None:
     """Generate the full v4 interactive operations dashboard.
 
     Args:
         resource_map: Full resource graph from collection phase.
         model: Quota impact model from build phase.
-        live_endpoint: Optional API Gateway URL for live refresh (Part 2).
         line_config: Parsed line-config.json.
         output_path: File path for the generated HTML file.
     """
     dashboard_data = build_dashboard_data(resource_map, model, line_config)
 
-    html = _render_v4_html(dashboard_data, live_endpoint)
+    html = _render_v4_html(dashboard_data)
 
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(html)
@@ -764,7 +762,7 @@ def generate_v4_dashboard(
     logger.info("V4 Dashboard generated: %s", output_path)
 
 
-def _render_v4_html(data: dict[str, Any], live_endpoint: str | None = None) -> str:
+def _render_v4_html(data: dict[str, Any]) -> str:
     """Render the complete v4 dashboard HTML with embedded data.
 
     The HTML template is the full interactive dashboard with CSS, JS,
@@ -1405,136 +1403,6 @@ function formatNum(n) {{ if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M'
 
 function render() {{ renderHealthStrip(); renderContent(); renderDetailPanel(); }}
 render();
-
-{_render_live_refresh_js(live_endpoint)}
 </script>
 </body>
 </html>"""
-
-
-def _render_live_refresh_js(live_endpoint: str | None) -> str:
-    """Generate the live refresh JavaScript block.
-
-    When live_endpoint is provided, adds a polling mechanism that:
-    - Fetches fresh metrics every 60 seconds
-    - Updates LINES, SYSTEM_API_USAGE, TOTAL_CAPACITY in place
-    - Re-renders the dashboard with new data
-    - Shows a "Last updated" timestamp
-    - Pauses polling when the tab is not visible
-
-    Args:
-        live_endpoint: API Gateway URL (e.g., https://xxx.execute-api.region.amazonaws.com/prod/metrics)
-
-    Returns:
-        JavaScript string to inject, or empty string if no endpoint.
-    """
-    if not live_endpoint:
-        return "// Live refresh disabled — no endpoint configured"
-
-    return f"""
-// ═══════════════════════════════════════════════════════════════════════════════
-// LIVE REFRESH — polls {live_endpoint} every 60s
-// ═══════════════════════════════════════════════════════════════════════════════
-
-(function() {{
-  const ENDPOINT = '{live_endpoint}';
-  const POLL_INTERVAL_MS = 60000; // 60 seconds
-  let pollTimer = null;
-  let lastUpdate = null;
-
-  // Add status indicator to header
-  const header = document.querySelector('.header h1');
-  const badge = header.querySelector('.data-badge');
-  if (badge) badge.innerHTML = '● Live <span id="live-ts" style="font-size:8px;opacity:0.7;margin-left:4px;"></span>';
-
-  async function fetchLiveData() {{
-    const view = state.timeView === 'plan' ? 'today' : state.timeView;
-    try {{
-      const url = `${{ENDPOINT}}?view=${{view}}`;
-      const resp = await fetch(url);
-      if (!resp.ok) throw new Error(`HTTP ${{resp.status}}`);
-      const data = await resp.json();
-      applyLiveData(data);
-      lastUpdate = new Date();
-      updateTimestamp();
-    }} catch (err) {{
-      console.warn('[LiveRefresh] Fetch failed:', err.message);
-      const badge = document.querySelector('.data-badge');
-      if (badge) badge.style.background = '#3a1c1c';
-      if (badge) badge.style.color = 'var(--red)';
-    }}
-  }}
-
-  function applyLiveData(data) {{
-    // Merge live LINES data (update volumes, keep static config)
-    if (data.LINES && data.LINES.length) {{
-      data.LINES.forEach((liveL, i) => {{
-        if (LINES[i]) {{
-          LINES[i].today = liveL.today || LINES[i].today;
-          LINES[i].hour = liveL.hour || LINES[i].hour;
-          if (liveL.hourly && liveL.hourly.some(v => v > 0)) {{
-            LINES[i].hourly = liveL.hourly;
-          }}
-          if (liveL.capacityPct) LINES[i].capacityPct = liveL.capacityPct;
-        }}
-      }});
-    }}
-
-    // Merge SYSTEM_API_USAGE
-    if (data.SYSTEM_API_USAGE) {{
-      Object.keys(data.SYSTEM_API_USAGE).forEach(api => {{
-        SYSTEM_API_USAGE[api] = data.SYSTEM_API_USAGE[api];
-      }});
-    }}
-
-    // Merge TOTAL_CAPACITY
-    if (data.TOTAL_CAPACITY) {{
-      Object.assign(TOTAL_CAPACITY, data.TOTAL_CAPACITY);
-    }}
-
-    // Re-render
-    render();
-
-    // Flash the badge green briefly
-    const badge = document.querySelector('.data-badge');
-    if (badge) {{
-      badge.style.background = '#1c3a1c';
-      badge.style.color = 'var(--green)';
-    }}
-  }}
-
-  function updateTimestamp() {{
-    const el = document.getElementById('live-ts');
-    if (el && lastUpdate) {{
-      el.textContent = lastUpdate.toLocaleTimeString();
-    }}
-  }}
-
-  function startPolling() {{
-    if (pollTimer) clearInterval(pollTimer);
-    fetchLiveData(); // Immediate first fetch
-    pollTimer = setInterval(fetchLiveData, POLL_INTERVAL_MS);
-  }}
-
-  function stopPolling() {{
-    if (pollTimer) {{ clearInterval(pollTimer); pollTimer = null; }}
-  }}
-
-  // Pause when tab is hidden
-  document.addEventListener('visibilitychange', () => {{
-    if (document.hidden) {{ stopPolling(); }}
-    else {{ startPolling(); }}
-  }});
-
-  // Re-fetch when time view changes
-  const origTimeHandler = document.querySelectorAll('.time-btn');
-  origTimeHandler.forEach(btn => {{
-    btn.addEventListener('click', () => {{
-      setTimeout(fetchLiveData, 100); // Fetch after state updates
-    }});
-  }});
-
-  // Start
-  startPolling();
-}})();
-"""
