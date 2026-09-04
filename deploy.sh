@@ -21,10 +21,6 @@ PYTHON_SCRIPT="lambda_function.py"
 # hardcoded quota definition instead of all 115.
 QUOTA_DEF_FILE="quota_definitions.json"
 
-# CloudFormation limits
-CF_INLINE_CODE_LIMIT=4096  # 4KB limit for inline Lambda code
-CF_TEMPLATE_SIZE_LIMIT=51200  # 50KB limit for CloudFormation template
-
 # Default parameters (can be overridden via environment variables)
 THRESHOLD_PERCENTAGE=${THRESHOLD_PERCENTAGE:-80}
 NOTIFICATION_EMAIL=${NOTIFICATION_EMAIL:-""}
@@ -256,52 +252,13 @@ validate_prerequisites() {
     log_success "Prerequisites validated"
 }
 
-# Function to detect code size and determine deployment method
+# Determine deployment method. The real Lambda (lambda_function.py +
+# quota_definitions.json) is ~40 KB, always far above CloudFormation's 4 KB
+# inline-code limit, so the code is always uploaded via S3. (The CFN template
+# ships a tiny placeholder that this deployer overwrites.)
 detect_deployment_method() {
-    log_step "Analyzing code size and determining deployment method..."
-    
-    # Create temporary deployment package to check size
-    local temp_dir=$(mktemp -d)
-    local temp_zip="$temp_dir/temp-package.zip"
-    
-    # Copy Python script to temp directory
-    cp "$PYTHON_SCRIPT" "$temp_dir/"
-
-    # Include the quota definitions data file so the size estimate matches the
-    # real package (see create_deployment_package)
-    if [ -f "$QUOTA_DEF_FILE" ]; then
-        cp "$QUOTA_DEF_FILE" "$temp_dir/"
-    fi
-
-    # Create ZIP package
-    cd "$temp_dir"
-    zip -r "$temp_zip" . > /dev/null 2>&1
-    cd - > /dev/null
-    
-    # Get package size
-    local package_size=$(stat -f%z "$temp_zip" 2>/dev/null || stat -c%s "$temp_zip" 2>/dev/null)
-    local package_size_kb=$((package_size / 1024))
-    
-    log_verbose "Lambda package size: ${package_size} bytes (${package_size_kb} KB)"
-    
-    # Clean up temp files
-    rm -rf "$temp_dir"
-    
-    # Determine deployment method
-    if [ "$FORCE_S3_DEPLOYMENT" = "true" ]; then
-        DEPLOYMENT_METHOD="s3"
-        log_info "Forced S3 deployment method"
-    elif [ "$package_size" -gt "$CF_INLINE_CODE_LIMIT" ]; then
-        DEPLOYMENT_METHOD="s3"
-        log_warning "Code size (${package_size_kb} KB) exceeds CloudFormation inline limit (4 KB)"
-        log_info "Automatically using S3 deployment method"
-    else
-        DEPLOYMENT_METHOD="placeholder"
-        log_info "Code size (${package_size_kb} KB) is within CloudFormation inline limit"
-        log_info "Using placeholder deployment method"
-    fi
-    
-    log_verbose "Selected deployment method: $DEPLOYMENT_METHOD"
+    DEPLOYMENT_METHOD="s3"
+    log_verbose "Deployment method: s3 (code exceeds the 4 KB inline limit)"
 }
 
 # Function to build CloudFormation parameters
@@ -499,34 +456,6 @@ upload_to_s3_and_update_lambda() {
     fi
     
     # Clean up local package
-    rm -f "lambda-deployment.zip"
-}
-
-# Function to update Lambda function directly (for small packages)
-update_lambda_directly() {
-    log_step "Updating Lambda function code directly..."
-    
-    local function_name=$(aws cloudformation describe-stacks \
-        --stack-name "$STACK_NAME" \
-        --query "Stacks[0].Outputs[?OutputKey=='LambdaFunction'].OutputValue" \
-        --output text)
-    
-    if [ -z "$function_name" ]; then
-        log_error "Lambda function name not found in stack outputs"
-        exit 1
-    fi
-    
-    log_info "Updating Lambda function: $function_name"
-    if aws lambda update-function-code \
-        --function-name "$function_name" \
-        --zip-file fileb://lambda-deployment.zip > /dev/null; then
-        log_success "Lambda function code updated successfully"
-    else
-        log_error "Failed to update Lambda function code"
-        exit 1
-    fi
-    
-    # Clean up package
     rm -f "lambda-deployment.zip"
 }
 
@@ -761,14 +690,10 @@ main() {
     
     # Create deployment package
     create_deployment_package
-    
-    # Deploy Lambda code based on method
-    if [ "$DEPLOYMENT_METHOD" = "s3" ]; then
-        upload_to_s3_and_update_lambda
-    else
-        update_lambda_directly
-    fi
-    
+
+    # Upload the real function code via S3 and update the Lambda
+    upload_to_s3_and_update_lambda
+
     # Test Lambda function
     test_lambda_function
     
