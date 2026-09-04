@@ -212,21 +212,6 @@ class MultiServiceClientManager:
             'required': False,
             'retry_config': {'max_attempts': 3, 'mode': 'standard'}
         },
-        'customer-profiles': {
-            'name': 'Amazon Connect Customer Profiles',
-            'required': False,
-            'retry_config': {'max_attempts': 3, 'mode': 'standard'}
-        },
-        'voice-id': {
-            'name': 'Amazon Connect Voice ID',
-            'required': False,
-            'retry_config': {'max_attempts': 3, 'mode': 'standard'}
-        },
-        'wisdom': {
-            'name': 'Amazon Connect Wisdom',
-            'required': False,
-            'retry_config': {'max_attempts': 3, 'mode': 'standard'}
-        },
         'connectcampaigns': {
             'name': 'Amazon Connect Outbound Campaigns',
             'required': False,
@@ -254,11 +239,6 @@ class MultiServiceClientManager:
         },
         'dynamodb': {
             'name': 'Amazon DynamoDB',
-            'required': False,
-            'retry_config': {'max_attempts': 3, 'mode': 'standard'}
-        },
-        'appintegrations': {
-            'name': 'Amazon AppIntegrations',
             'required': False,
             'retry_config': {'max_attempts': 3, 'mode': 'standard'}
         },
@@ -2019,8 +1999,6 @@ class ConnectQuotaMonitor:
                 params['InstanceId'] = instance_id
             elif service == 'connectcases':
                 params['instanceId'] = instance_id
-            elif service == 'wisdom':
-                params['instanceId'] = instance_id
             elif service == 'connectcampaigns':
                 params['instanceId'] = instance_id
         
@@ -2061,19 +2039,6 @@ class ConnectQuotaMonitor:
                 'list_domains': 'domains',
                 'list_fields': 'fields',
                 'list_templates': 'templates'
-            },
-            'customer-profiles': {
-                'list_domains': 'Items',
-                'list_profile_object_types': 'Items'
-            },
-            'voice-id': {
-                'list_domains': 'DomainSummaries',
-                'list_speakers': 'SpeakerSummaries',
-                'list_fraudsters': 'FraudsterSummaries'
-            },
-            'wisdom': {
-                'list_knowledge_bases': 'knowledgeBaseSummaries',
-                'list_contents': 'contentSummaries'
             },
             'connectcampaigns': {
                 'list_campaigns': 'campaignSummaryList'
