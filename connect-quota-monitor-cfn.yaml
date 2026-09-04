@@ -218,6 +218,7 @@ Resources:
     Type: AWS::KMS::Key
     Properties:
       Description: KMS key for SNS topic encryption - Connect Quota Monitor
+      EnableKeyRotation: true
       KeyPolicy:
         Statement:
           - Sid: Enable IAM User Permissions
@@ -268,6 +269,8 @@ Resources:
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Properties:
+      VersioningConfiguration:
+        Status: Enabled
       BucketEncryption:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
@@ -288,6 +291,8 @@ Resources:
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Properties:
+      VersioningConfiguration:
+        Status: Enabled
       BucketEncryption:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
@@ -320,6 +325,7 @@ Resources:
     Condition: UseDynamoDB
     Properties:
       Description: KMS key for DynamoDB table encryption
+      EnableKeyRotation: true
       KeyPolicy:
         Statement:
           - Sid: Enable IAM User Permissions
@@ -659,6 +665,7 @@ Resources:
     Type: AWS::KMS::Key
     Properties:
       Description: KMS key for Lambda environment variables encryption
+      EnableKeyRotation: true
       KeyPolicy:
         Statement:
           - Sid: Enable IAM User Permissions
