@@ -13,7 +13,7 @@ Usage:
     python3 test_cloudwatch_fix.py --instance-id <YOUR_CONNECT_INSTANCE_ID> --region us-east-1 --inject-dummy
 
     # Test against Allstate prod (read-only, just validates metric exists)
-    python3 test_cloudwatch_fix.py --instance-id 587c546e-2328-4c36-baa2-37eaf4749631 --region us-east-1 --read-only
+    python3 test_cloudwatch_fix.py --instance-id YOUR_INSTANCE_ID --region us-east-1 --read-only
 """
 
 import boto3

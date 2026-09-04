@@ -29,7 +29,7 @@ Required IAM Permissions (read-only):
 Usage:
     pip install boto3
     python connect-resource-mapper.py \\
-        --instance-id 587c546e-2328-4c36-baa2-37eaf4749631 \\
+        --instance-id YOUR_INSTANCE_ID \\
         --region us-east-1 \\
         --output-dir ./output
 
@@ -871,7 +871,7 @@ def main() -> None:
         epilog=(
             "Example:\n"
             "  python connect-resource-mapper.py \\\n"
-            "    --instance-id 587c546e-2328-4c36-baa2-37eaf4749631 \\\n"
+            "    --instance-id YOUR_INSTANCE_ID \\\n"
             "    --region us-east-1 \\\n"
             "    --output-dir ./output\n"
         ),
