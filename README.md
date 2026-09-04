@@ -67,6 +67,24 @@ After deploying, **check your inbox** for an SNS subscription confirmation email
 - If any quota exceeds 80% utilization → you get one consolidated email per instance
 - The email lists all breaching quotas with current values and limits
 
+### How it finds your Connect instance
+
+You do **not** configure an instance ID for the monitor. On each run the Lambda
+calls `connect:ListInstances` to discover **every** Connect instance in the
+account and Region, then reads each instance's resources (queues, flows, users,
+Lambda associations, etc.) with instance-scoped `connect:List*`/`Describe*`
+calls, and pulls usage from CloudWatch (`AWS/Connect`, `AWS/Usage`) and Service
+Quotas. This is why no instance ID is needed and why hardcoding one is flagged
+as an anti-pattern. Required read-only permissions are listed in
+[iam/README.md](iam/README.md) (the key one for discovery is
+`connect:ListInstances`).
+
+> The optional CLI tool (`connect-resource-mapper.py`) and the `live-refresh`
+> stack *do* target a single instance. Find your instance ID in the Amazon
+> Connect console URL (`.../connect/home?...#/instance/<INSTANCE_ID>/...`) or via
+> `aws connect list-instances --query "InstanceSummaryList[].{Id:Id,Alias:InstanceAlias}"`,
+> then pass it as `--instance-id` / the `ConnectInstanceId` parameter.
+
 ---
 
 ## Configuration options
