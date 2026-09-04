@@ -78,11 +78,10 @@ Parameters:
     
   LambdaRuntime:
     Type: String
-    Default: python3.12
-    AllowedValues: 
+    Default: python3.13
+    AllowedValues:
+      - python3.13
       - python3.12
-      - python3.11
-      - python3.10
     Description: Python runtime version for Lambda function
     
   DeploymentMethod:
@@ -173,17 +172,12 @@ Conditions:
   # Deployment conditions
   CreateDeploymentBucket: !Equals [!Ref CreateDeploymentBucket, 'true']
   UseProvidedDeploymentBucket: !Not [!Equals [!Ref DeploymentBucketName, '']]
-  UseS3Deployment: !Equals [!Ref DeploymentMethod, 's3']
-  
+
   # Notification conditions
   SubscribeEmail: !Not [!Equals [!Ref NotificationEmail, '']]
-  
+
   # Network conditions
   UseVPC: !Not [!Equals [!Ref VpcId, '']]
-  HasSubnets: !Not [!Equals [!Join ['', !Ref SubnetIds], '']]
-  
-  # Validation conditions
-  ValidVPCConfig: !Or [!Not [!Condition UseVPC], !Condition HasSubnets]
 
 Resources:
   # S3 Bucket for Lambda deployment packages (for large code)
@@ -272,6 +266,7 @@ Resources:
     Type: AWS::S3::Bucket
     Condition: CreateS3Bucket
     DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       BucketEncryption:
         ServerSideEncryptionConfiguration:
@@ -291,6 +286,7 @@ Resources:
     Type: AWS::S3::Bucket
     Condition: CreateS3Bucket
     DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       BucketEncryption:
         ServerSideEncryptionConfiguration:
@@ -396,6 +392,16 @@ Resources:
   S3StoragePolicy:
     Type: AWS::IAM::ManagedPolicy
     Condition: UseS3
+    Metadata:
+      # W1031: the ${S3BucketName} branch of the !If only resolves when
+      # CreateS3Bucket is False, which (per the condition) means S3BucketName is
+      # non-empty -> the ARN is well-formed. cfn-lint cannot correlate the
+      # condition with the parameter value, so it flags the empty-name case that
+      # can never occur here.
+      cfn-lint:
+        config:
+          ignore_checks:
+            - W1031
     Properties:
       ManagedPolicyName: !Sub "${AWS::StackName}-S3StoragePolicy"
       PolicyDocument:
@@ -549,9 +555,9 @@ Resources:
               - Sid: AppIntegrationsPermissions
                 Effect: Allow
                 Action:
-                  - appintegrations:ListApplications
-                  - appintegrations:ListDataIntegrations
-                  - appintegrations:ListEventIntegrations
+                  - app-integrations:ListApplications
+                  - app-integrations:ListDataIntegrations
+                  - app-integrations:ListEventIntegrations
                 Resource: '*'
               
               # Service Quotas permissions
@@ -905,7 +911,10 @@ Outputs:
     
   S3BucketName:
     Description: "S3 bucket for metrics and reports storage"
-    Value: !If [CreateS3Bucket, !Ref MetricsS3Bucket, !If [UseProvidedS3Bucket, !Ref S3BucketName, "Not using S3 storage"]]
+    # This output only renders under Condition: UseS3, so S3 is in use: the bucket
+    # is either the created one or the caller-provided name (the "not using S3"
+    # branch was unreachable here).
+    Value: !If [CreateS3Bucket, !Ref MetricsS3Bucket, !Ref S3BucketName]
     Condition: UseS3
     Export:
       Name: !Sub "${AWS::StackName}-S3BucketName"

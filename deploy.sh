@@ -16,6 +16,10 @@ SCRIPT_NAME="Enhanced Connect Quota Monitor Deployment"
 STACK_NAME="${STACK_NAME:-ConnectQuotaMonitor}"
 TEMPLATE_FILE="connect-quota-monitor-cfn.yaml"
 PYTHON_SCRIPT="lambda_function.py"
+# Data file the Lambda loads at import time (quota_definitions.json). Must be
+# packaged alongside the code, or the function silently falls back to a single
+# hardcoded quota definition instead of all 115.
+QUOTA_DEF_FILE="quota_definitions.json"
 
 # CloudFormation limits
 CF_INLINE_CODE_LIMIT=4096  # 4KB limit for inline Lambda code
@@ -262,7 +266,13 @@ detect_deployment_method() {
     
     # Copy Python script to temp directory
     cp "$PYTHON_SCRIPT" "$temp_dir/"
-    
+
+    # Include the quota definitions data file so the size estimate matches the
+    # real package (see create_deployment_package)
+    if [ -f "$QUOTA_DEF_FILE" ]; then
+        cp "$QUOTA_DEF_FILE" "$temp_dir/"
+    fi
+
     # Create ZIP package
     cd "$temp_dir"
     zip -r "$temp_zip" . > /dev/null 2>&1
@@ -406,7 +416,18 @@ create_deployment_package() {
     
     # Copy Python script
     cp "$PYTHON_SCRIPT" "$package_dir/"
-    
+
+    # Copy the quota definitions data file the Lambda loads at import time.
+    # Without this the deployed function falls back to a single hardcoded quota
+    # (see lambda_function.py _QUOTA_FILE) and silently monitors almost nothing.
+    if [ -f "$QUOTA_DEF_FILE" ]; then
+        log_verbose "Including $QUOTA_DEF_FILE in package"
+        cp "$QUOTA_DEF_FILE" "$package_dir/"
+    else
+        log_error "$QUOTA_DEF_FILE not found; the deployed Lambda would monitor only one quota. Aborting."
+        exit 1
+    fi
+
     # Add any additional files if they exist
     if [ -f "requirements.txt" ]; then
         log_verbose "Found requirements.txt, including in package"

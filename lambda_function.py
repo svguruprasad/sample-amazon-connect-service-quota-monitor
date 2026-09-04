@@ -33,7 +33,7 @@ It automatically discovers Connect instances and monitors all configured quotas.
 import boto3
 import logging
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import os
 import sys
 import re
@@ -41,7 +41,6 @@ import time
 from botocore.exceptions import ClientError, BotoCoreError
 from botocore.config import Config
 import uuid
-import io
 
 # Configure logging with secure defaults
 logging.basicConfig(
@@ -59,9 +58,7 @@ try:
         SecurityDataSanitizer, 
         SecurityConfigValidator,
         log_secure_info,
-        log_secure_warning,
         log_secure_error,
-        log_secure_debug
     )
     ENHANCED_SECURITY_AVAILABLE = True
 except ImportError:
@@ -80,10 +77,7 @@ try:
     from enhanced_error_handling import (
         EnhancedErrorHandler,
         ErrorContext,
-        ErrorCategory,
         ErrorSeverity,
-        error_handler_decorator,
-        GracefulDegradationManager
     )
     ENHANCED_ERROR_HANDLING_AVAILABLE = True
 except ImportError:
@@ -97,7 +91,6 @@ try:
         CacheConfig,
         ParallelConfig,
         PaginationConfig,
-        performance_monitor
     )
     PERFORMANCE_OPTIMIZER_AVAILABLE = True
 except ImportError:
@@ -139,7 +132,29 @@ def get_validated_config():
 
 # Get validated configuration
 CONFIG = get_validated_config()
-THRESHOLD_PERCENTAGE = int(CONFIG.get('threshold_percentage', '80'))  # Default to 80% for production
+
+
+def _coerce_threshold(value, default=80):
+    """Coerce the threshold to a sane int in [1, 100].
+
+    Runs at import time (Lambda cold start), so a bad THRESHOLD_PERCENTAGE env
+    value must not raise -- that would fail every invocation. Fall back to the
+    default instead. (The enhanced-security validator only runs when that
+    optional module is present.)
+    """
+    try:
+        parsed = int(float(value))
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError covers 'inf'/'-inf'/'1e400' (float(inf) -> int fails).
+        logger.warning(f"Invalid THRESHOLD_PERCENTAGE {value!r}; using default {default}")
+        return default
+    if not 1 <= parsed <= 100:
+        logger.warning(f"THRESHOLD_PERCENTAGE {parsed} out of range 1-100; using default {default}")
+        return default
+    return parsed
+
+
+THRESHOLD_PERCENTAGE = _coerce_threshold(CONFIG.get('threshold_percentage', '80'))  # Default 80% for production
 EXECUTION_ID = str(uuid.uuid4())  # Unique ID for this execution for traceability
 
 # Load quota definitions from JSON (extracted from inline dict for maintainability)
@@ -733,7 +748,7 @@ class ConnectQuotaMonitor:
                 if self.error_handler and hasattr(self.error_handler, 'degradation_manager'):
                     from enhanced_error_handling import ErrorContext
                     context = ErrorContext(operation=f"{service_name}.{api_method}", service=service_name)
-                    error_details = self.error_handler.handle_error(e, context)
+                    self.error_handler.handle_error(e, context)
                 
                 # Handle specific error types
                 if error_code in ['Throttling', 'ThrottlingException', 'RequestLimitExceeded']:
@@ -836,23 +851,26 @@ class ConnectQuotaMonitor:
                             ],
                             'Projection': {
                                 'ProjectionType': 'ALL'
-                            },
-                            'ProvisionedThroughput': {
-                                'ReadCapacityUnits': 5,
-                                'WriteCapacityUnits': 5
                             }
+                            # No ProvisionedThroughput: PAY_PER_REQUEST tables have
+                            # on-demand GSIs (specifying it here would be rejected).
                         }
                     ],
-                    ProvisionedThroughput={
-                        'ReadCapacityUnits': 5,
-                        'WriteCapacityUnits': 5
-                    }
+                    # On-demand billing matches the documented behaviour (README)
+                    # and avoids throttling this bursty, low-volume workload.
+                    BillingMode='PAY_PER_REQUEST'
                 )
-                
+
                 # Wait for table to be created
                 table.meta.client.get_waiter('table_exists').wait(TableName=self.dynamodb_table)
                 logger.info(f"DynamoDB table {sanitize_log(self.dynamodb_table)} created successfully")
-        
+            else:
+                # Any other error (e.g. AccessDenied, throttling) must not be
+                # silently swallowed -- surface it so storage init fails loudly
+                # instead of proceeding as if the table were ready.
+                logger.error(f"Error checking DynamoDB table {sanitize_log(self.dynamodb_table)}: {e.response['Error']['Code']}")
+                raise
+
     def get_connect_instances(self, force_refresh=False):
         """
         Enhanced dynamic instance discovery with caching and comprehensive error handling.
@@ -869,9 +887,7 @@ class ConnectQuotaMonitor:
             if cache_age.total_seconds() < 300:  # 5 minute cache
                 logger.debug(f"Using cached instances ({len(self._cached_instances)} instances)")
                 return self._cached_instances
-        
-        instances = []
-        
+
         # Use enhanced error handling if available
         if self.error_handler and ENHANCED_ERROR_HANDLING_AVAILABLE:
             context = ErrorContext(
@@ -949,7 +965,7 @@ class ConnectQuotaMonitor:
             
             return valid_instances
             
-        except Exception as e:
+        except Exception:
             # Re-raise for enhanced error handler to catch
             raise
     
@@ -1210,14 +1226,8 @@ class ConnectQuotaMonitor:
                 validation_results['issues'].append(f"Hardcoded environment variable found: {env_var}")
                 validation_results['is_distribution_ready'] = False
         
-        # Check for hardcoded instance IDs in common formats
-        hardcoded_patterns = [
-            r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',  # UUID format
-            r'arn:aws:connect:[^:]+:[0-9]{12}:instance/[0-9a-f-]+',  # Connect instance ARN
-            r'[0-9]{12}'  # Account ID
-        ]
-        
-        # This is a basic check - in a real implementation, you'd scan the actual code files
+        # This is a basic check - in a real implementation, you'd scan the actual
+        # code files for hardcoded instance IDs / ARNs / account IDs.
         logger.info("Validating solution for distribution readiness...")
         
         # Check if we're using dynamic discovery (good sign)
@@ -1272,7 +1282,7 @@ class ConnectQuotaMonitor:
         """
         # Use environment variable threshold or default
         if threshold_percentage is None:
-            threshold_percentage = int(os.environ.get('THRESHOLD_PERCENTAGE', THRESHOLD_PERCENTAGE))
+            threshold_percentage = _coerce_threshold(os.environ.get('THRESHOLD_PERCENTAGE', THRESHOLD_PERCENTAGE))
         
         logger.info("=== Starting Dynamic Connect Quota Monitoring ===")
         
@@ -1491,7 +1501,7 @@ class ConnectQuotaMonitor:
             topic_arn = os.environ.get('ALERT_SNS_TOPIC_ARN')
         
         if not threshold_percentage:
-            threshold_percentage = int(os.environ.get('THRESHOLD_PERCENTAGE', THRESHOLD_PERCENTAGE))
+            threshold_percentage = _coerce_threshold(os.environ.get('THRESHOLD_PERCENTAGE', THRESHOLD_PERCENTAGE))
         
         if not topic_arn:
             logger.error("No SNS topic ARN provided for alerts")
@@ -1668,7 +1678,7 @@ class ConnectQuotaMonitor:
     def get_current_configuration(self):
         """Get current configuration settings for management purposes."""
         config = {
-            'threshold_percentage': int(os.environ.get('THRESHOLD_PERCENTAGE', THRESHOLD_PERCENTAGE)),
+            'threshold_percentage': _coerce_threshold(os.environ.get('THRESHOLD_PERCENTAGE', THRESHOLD_PERCENTAGE)),
             'alert_sns_topic_arn': os.environ.get('ALERT_SNS_TOPIC_ARN', ''),
             's3_bucket': self.s3_bucket or '',
             'use_dynamodb': self.use_dynamodb,
@@ -1735,8 +1745,8 @@ class ConnectQuotaMonitor:
         
         # Apply threshold update
         if 'threshold_percentage' in new_config:
-            old_threshold = int(os.environ.get('THRESHOLD_PERCENTAGE', THRESHOLD_PERCENTAGE))
-            new_threshold = int(new_config['threshold_percentage'])
+            old_threshold = _coerce_threshold(os.environ.get('THRESHOLD_PERCENTAGE', THRESHOLD_PERCENTAGE))
+            new_threshold = _coerce_threshold(new_config['threshold_percentage'])
             if old_threshold != new_threshold:
                 logger.info(f"Threshold updated from {old_threshold}% to {new_threshold}%")
                 # Note: Environment variable updates require Lambda function configuration update
@@ -1898,7 +1908,7 @@ class ConnectQuotaMonitor:
                 )
             except Exception as e:
                 log_secure_error(
-                    f"Quota utilization monitoring failed after all retries",
+                    "Quota utilization monitoring failed after all retries",
                     error=e,
                     quota_code=quota_code,
                     instance_id=instance_id
@@ -1918,7 +1928,7 @@ class ConnectQuotaMonitor:
             return self._process_quota_config(instance_id, quota_config, quota_code)
         except Exception as e:
             log_secure_error(
-                f"Basic quota utilization monitoring failed",
+                "Basic quota utilization monitoring failed",
                 error=e,
                 quota_code=quota_code,
                 instance_id=instance_id
@@ -2108,11 +2118,19 @@ class ConnectQuotaMonitor:
             # Build parameters for child API call
             child_params = {parent_key: parent_id}
             
-            # Count child resources
+            # Count child resources. A None result means the child pagination was
+            # truncated or failed; summing only the successful children would
+            # under-report the aggregate and hide a breach ("silently healthy").
+            # Propagate None so the whole quota is reported as unavailable instead.
             child_count = self._count_via_pagination_enhanced(service, api_name, child_response_key, child_params)
-            if child_count is not None:
-                total_count += child_count
-        
+            if child_count is None:
+                logger.error(
+                    f"Child count unavailable for parent {parent_id} in {service}.{api_name}; "
+                    f"aggregate is incomplete, reporting quota as unavailable"
+                )
+                return None
+            total_count += child_count
+
         return total_count
     
     def _monitor_via_cloudwatch(self, instance_id, metric_config):
@@ -2158,10 +2176,15 @@ class ConnectQuotaMonitor:
                 Statistics=[statistic]
             )
             
+            # Track which metric name actually produced the datapoints we use, so
+            # we can reject percentage-typed metrics below (they are not counts).
+            effective_metric_name = metric_name
+
             # If no data with primary metric name, try fallback
             if (not response or not response.get('Datapoints')) and metric_config.get('metric_name_fallback'):
                 fallback_name = metric_config['metric_name_fallback']
                 logger.info(f"No data for {metric_name}, trying fallback: {fallback_name}")
+                effective_metric_name = fallback_name
                 response = self.call_service_api(
                     'cloudwatch',
                     'get_metric_statistics',
@@ -2174,9 +2197,13 @@ class ConnectQuotaMonitor:
                     Statistics=[statistic]
                 )
             
-            # If still no data, try without MetricGroup dimension (backward compat)
+            # If still no data, try the PRIMARY metric without the MetricGroup
+            # dimension (backward compat). This re-queries metric_name, so reset
+            # effective_metric_name -- otherwise a stale percentage fallback name
+            # would cause the guard below to wrongly reject valid primary data.
             if (not response or not response.get('Datapoints')) and metric_group:
                 logger.info(f"No data for {metric_name} with MetricGroup={metric_group}, trying without MetricGroup dimension")
+                effective_metric_name = metric_name
                 dimensions_no_group = [d for d in dimensions if d['Name'] != 'MetricGroup']
                 response = self.call_service_api(
                     'cloudwatch',
@@ -2193,11 +2220,22 @@ class ConnectQuotaMonitor:
             if not response or not response.get('Datapoints'):
                 logger.debug(f"No CloudWatch data for metric {metric_name}")
                 return 0
-            
+
+            # Reject percentage-typed metrics: this path returns a raw count that the
+            # caller divides by the quota limit. Feeding a 0-100 percentage in here
+            # produces nonsense utilization (e.g. 80% -> 80/10 -> 800%, a false
+            # CRITICAL). A percentage metric is not a valid proxy for a count quota.
+            if effective_metric_name.lower().endswith(('percentage', 'percent')):
+                logger.warning(
+                    f"Ignoring percentage metric '{effective_metric_name}' for a count-based "
+                    f"quota; it cannot be used as a usage count. Treating usage as unavailable."
+                )
+                return 0
+
             # Get the most recent datapoint
             datapoints = sorted(response['Datapoints'], key=lambda x: x['Timestamp'], reverse=True)
             latest_value = datapoints[0].get(statistic, 0)
-            
+
             return int(latest_value)
             
         except Exception as e:
@@ -2206,57 +2244,70 @@ class ConnectQuotaMonitor:
     
     def _monitor_via_cloudwatch_api(self, instance_id, metric_config):
         """
-        Monitor API rate limits via CloudWatch API usage metrics.
-        Returns current usage (TPS) as integer.
-        Note: Actual quota limit will be fetched separately to get applied quota vs default.
+        Monitor API request-rate limits via CloudWatch API usage metrics.
+        Returns current usage in TPS (requests/second) as an integer.
+
+        Amazon Connect API request rates are published to the CloudWatch
+        ``AWS/Usage`` namespace as the ``CallCount`` metric with dimensions
+        Service=Connect, Type=API, Resource=<operation>, Class=None (the same
+        metric Service Quotas graphs via SERVICE_QUOTA()). The Connect throttling
+        quotas are per-account/per-Region, so no InstanceId dimension applies.
+        See: https://repost.aws/knowledge-center/cloudwatch-api-call-usage
+
+        Note (hard limitation): CloudWatch usage metrics have a minimum 1-minute
+        resolution, so a true per-second peak is not observable. We take the
+        busiest single minute over the lookback window and divide by 60 to get
+        the peak average TPS for that minute -- more conservative than averaging
+        the whole window, but it can still understate a sub-minute burst.
         """
         operation = metric_config.get('operation')
-        namespace = metric_config.get('namespace', 'AWS/Connect')
-        
+
         if not operation:
             logger.error("No operation specified for cloudwatch_api method")
             return None
-        
-        # Build dimensions for API metrics
+
+        # API usage lives in AWS/Usage, not AWS/Connect. The namespace field in
+        # the quota definition is not used for this method.
         dimensions = [
-            {'Name': 'Operation', 'Value': operation}
+            {'Name': 'Service', 'Value': 'Connect'},
+            {'Name': 'Class', 'Value': 'None'},
+            {'Name': 'Type', 'Value': 'API'},
+            {'Name': 'Resource', 'Value': operation},
         ]
-        
-        if metric_config.get('scope') == 'INSTANCE' and instance_id:
-            dimensions.append({
-                'Name': 'InstanceId',
-                'Value': instance_id
-            })
-        
-        # Get API call count from CloudWatch over last 5 minutes
+
+        # Look back 15 minutes and inspect per-minute call counts.
         end_time = datetime.now(timezone.utc)
-        start_time = end_time - timedelta(minutes=5)
-        
+        start_time = end_time - timedelta(minutes=15)
+
         try:
             response = self.call_service_api(
                 'cloudwatch',
                 'get_metric_statistics',
-                Namespace=namespace,
-                MetricName='APICallCount',
+                Namespace='AWS/Usage',
+                MetricName='CallCount',
                 Dimensions=dimensions,
                 StartTime=start_time,
                 EndTime=end_time,
-                Period=60,  # 1 minute periods for granular rate calculation
+                Period=60,  # 1-minute periods
                 Statistics=['Sum']
             )
-            
+
             if not response or not response.get('Datapoints'):
                 # No recent API calls detected
                 return 0
-            
-            # Calculate average rate per second over the period
-            total_calls = sum(dp.get('Sum', 0) for dp in response['Datapoints'])
-            rate_per_second = total_calls / 300  # 5 minutes = 300 seconds
-            
-            # Return as integer (rounded up to be conservative)
-            import math
-            return int(math.ceil(rate_per_second))
-            
+
+            # Peak calls in any single minute over the window, converted to an
+            # average per-second rate to compare against the per-second quota.
+            # Return the float rate -- do NOT ceil to an int. Connect rate limits
+            # can be fractional (e.g. SearchContacts = 0.5/s) or small (1-2/s), and
+            # ceil() would make the smallest observable non-zero rate 1 TPS, i.e. a
+            # single call in 15 min would read as 200% of a 0.5 limit -> false
+            # CRITICAL. Utilization is computed downstream as usage/limit*100.
+            peak_calls_per_minute = max(dp.get('Sum', 0) for dp in response['Datapoints'])
+            rate_per_second = peak_calls_per_minute / 60.0
+
+            return round(rate_per_second, 4)
+
         except Exception as e:
             logger.error(f"Error getting API rate for {operation}: {sanitize_log(str(e))}")
             return None
@@ -2289,16 +2340,86 @@ class ConnectQuotaMonitor:
                 return None, metric_config.get('default_limit', 0)
             
             quota_info = response['Quota']
-            current_usage = quota_info.get('UsageMetric', {}).get('MetricValue', 0)
-            quota_limit = quota_info.get('Value', metric_config.get('default_limit', 0))
-            
-            return int(current_usage), int(quota_limit)
-            
+            # Keep as float: Value is a double and some Connect rate quotas are
+            # fractional (e.g. 0.5). int() would truncate 0.5 -> 0, and the
+            # downstream `if quota_limit > 0` guard would then force 0% and mask a
+            # breach. Consistent with _extract_applied_quota_value (float()).
+            quota_limit = float(quota_info.get('Value', metric_config.get('default_limit', 0)))
+
+            # NOTE: UsageMetric is *metadata* describing which CloudWatch metric
+            # reflects usage (MetricNamespace/MetricName/MetricDimensions/
+            # MetricStatisticRecommendation) -- it does NOT carry a usage value.
+            # The previous code read a non-existent 'MetricValue' key, so every
+            # service_quotas quota reported 0 usage (0%) and never alerted. If a
+            # UsageMetric is present we query CloudWatch for the real usage; if
+            # not, usage is genuinely unavailable via Service Quotas -> return
+            # None (unknown) so the quota is skipped rather than falsely "0%".
+            usage_metric = quota_info.get('UsageMetric')
+            if usage_metric:
+                current_usage = self._query_usage_from_usage_metric(usage_metric)
+            else:
+                logger.debug(f"No UsageMetric for {quota_code}; usage not available via Service Quotas")
+                current_usage = None
+
+            return current_usage, quota_limit
+
         except Exception as e:
             logger.warning(f"Error getting quota from Service Quotas API: {sanitize_log(str(e))}")
             # Fall back to default limit
             return None, metric_config.get('default_limit', 0)
-    
+
+    def _query_usage_from_usage_metric(self, usage_metric):
+        """Query CloudWatch for current usage described by a ServiceQuota UsageMetric.
+
+        Returns the usage as an int, or None if no datapoints / on error.
+        """
+        namespace = usage_metric.get('MetricNamespace')
+        metric_name = usage_metric.get('MetricName')
+        if not namespace or not metric_name:
+            return None
+
+        # MetricDimensions is a {name: value} map; CloudWatch wants a list.
+        dimensions = [
+            {'Name': k, 'Value': v}
+            for k, v in (usage_metric.get('MetricDimensions') or {}).items()
+        ]
+        statistic = usage_metric.get('MetricStatisticRecommendation') or 'Maximum'
+
+        end_time = datetime.now(timezone.utc)
+        start_time = end_time - timedelta(minutes=15)
+        try:
+            response = self.call_service_api(
+                'cloudwatch',
+                'get_metric_statistics',
+                Namespace=namespace,
+                MetricName=metric_name,
+                Dimensions=dimensions,
+                StartTime=start_time,
+                EndTime=end_time,
+                Period=300,
+                Statistics=[statistic],
+            )
+            datapoints = (response or {}).get('Datapoints') or []
+            if not datapoints:
+                return None
+            # Most recent datapoint for the recommended statistic.
+            latest = sorted(datapoints, key=lambda x: x['Timestamp'], reverse=True)[0]
+            return int(latest.get(statistic, 0))
+        except Exception as e:
+            logger.warning(f"Error querying usage metric {namespace}/{metric_name}: {sanitize_log(str(e))}")
+            return None
+
+    @staticmethod
+    def _extract_applied_quota_value(response, quota_code):
+        """Return the applied quota Value from a get_service_quota response, or None."""
+        if response and 'Quota' in response:
+            applied_value = response['Quota'].get('Value')
+            if applied_value is not None:
+                applied_float = float(applied_value)
+                logger.debug(f"Retrieved applied quota for {quota_code}: {applied_float}")
+                return applied_float
+        return None
+
     def _get_actual_quota_limit(self, service, quota_code, instance_id=None, context_required=False):
         """
         Get the actual applied quota limit from Service Quotas API with caching.
@@ -2339,49 +2460,58 @@ class ConnectQuotaMonitor:
                 'QuotaCode': quota_code
             }
             
-            # Add instance context if required
+            # Add instance context only for quotas that support resource-level
+            # adjustability. Sending a ContextId for a non-resource-level (or
+            # non-adjustable) Connect quota raises NoSuchResourceException; we
+            # retry without it below rather than silently falling back to the
+            # hardcoded default.
+            used_context = False
             if context_required and instance_id:
                 context_id = f"arn:aws:connect:{self.region}:{self._get_account_id()}:instance/{instance_id}"
                 params['ContextId'] = context_id
+                used_context = True
                 logger.debug(f"Fetching context-aware quota for {quota_code} with context: {context_id}")
-            
+
             # Try to get the applied quota value
             response = self.call_service_api('service-quotas', 'get_service_quota', **params)
-            
-            if response and 'Quota' in response:
-                quota_info = response['Quota']
-                applied_value = quota_info.get('Value')
-                
-                if applied_value is not None:
-                    applied_float = float(applied_value)
-                    logger.debug(f"Retrieved applied quota for {quota_code}: {applied_float}")
-                    
-                    # Cache the result
-                    self._quota_limit_cache[cache_key] = (applied_float, datetime.now(timezone.utc))
-                    return applied_float
-            
+
+            applied_float = self._extract_applied_quota_value(response, quota_code)
+            if applied_float is not None:
+                self._quota_limit_cache[cache_key] = (applied_float, datetime.now(timezone.utc))
+                return applied_float
+
             # If we can't get the applied value, cache None and return None to use default
             logger.debug(f"Could not retrieve applied quota for {quota_code}, will use default")
             self._quota_limit_cache[cache_key] = (None, datetime.now(timezone.utc))
             return None
-            
+
         except ClientError as e:
             error_code = e.response['Error']['Code']
-            
-            # NoSuchResourceException means this quota doesn't have a service quota entry
-            # This is expected for some quotas that don't have L-codes or aren't in Service Quotas
-            if error_code == 'NoSuchResourceException':
+
+            # NoSuchResource/ResourceNotFound: the quota code exists but not for
+            # the (context) resource we asked about. If we sent a ContextId, retry
+            # once WITHOUT it to get the account/Region-level applied value before
+            # giving up -- otherwise we would silently use the hardcoded default
+            # and miss any customer quota increase.
+            if error_code in ('NoSuchResourceException', 'ResourceNotFoundException'):
+                if used_context:
+                    logger.debug(f"Context-aware lookup for {quota_code} failed ({error_code}); retrying without ContextId")
+                    try:
+                        response = self.call_service_api(
+                            'service-quotas', 'get_service_quota',
+                            ServiceCode=service, QuotaCode=quota_code
+                        )
+                        applied_float = self._extract_applied_quota_value(response, quota_code)
+                        if applied_float is not None:
+                            self._quota_limit_cache[cache_key] = (applied_float, datetime.now(timezone.utc))
+                            return applied_float
+                    except ClientError as retry_err:
+                        logger.debug(f"Retry without context for {quota_code} failed: {retry_err.response['Error']['Code']}")
                 logger.debug(f"Quota {quota_code} not found in Service Quotas API (expected for some quotas)")
                 # Cache this negative result to avoid repeated API calls
                 self._quota_limit_cache[cache_key] = (None, datetime.now(timezone.utc))
                 return None
-            
-            # ResourceNotFoundException - similar to above
-            elif error_code == 'ResourceNotFoundException':
-                logger.debug(f"Quota {quota_code} resource not found in Service Quotas API")
-                self._quota_limit_cache[cache_key] = (None, datetime.now(timezone.utc))
-                return None
-            
+
             # AccessDeniedException - permission issue
             elif error_code == 'AccessDeniedException':
                 logger.warning(f"Access denied when fetching quota {quota_code} - check IAM permissions")
@@ -2494,41 +2624,50 @@ class ConnectQuotaMonitor:
             # Fallback to original implementation
             total_count = 0
             next_token = None
-            max_pages = 100  # Prevent infinite loops
+            # Safety bound to prevent infinite loops. Set well above any realistic
+            # Connect resource count so we do not truncate legitimate data.
+            max_pages = 500
             page_count = 0
-            
-            while page_count < max_pages:
-                # Add pagination token if available
+            truncated = False
+
+            while True:
+                # All Connect/related list APIs use the 'NextToken' pagination key.
                 api_params = params.copy()
                 if next_token:
-                    # Different services use different pagination token names
-                    if service in ['connectcases', 'customer-profiles', 'voice-id']:
-                        api_params['NextToken'] = next_token
-                    else:
-                        api_params['NextToken'] = next_token
-                
+                    api_params['NextToken'] = next_token
+
                 # Call the API
                 response = self.call_service_api(service, api_name, **api_params)
                 if not response:
                     logger.warning(f"No response from {service}.{api_name}")
                     break
-                
+
                 # Count items in this page
                 items = response.get(response_key, [])
                 total_count += len(items)
-                
+
                 # Check for next page
                 next_token = response.get('NextToken')
                 if not next_token:
                     break
-                
+
                 page_count += 1
-            
-            if page_count >= max_pages:
-                logger.warning(f"Reached maximum pages ({max_pages}) for {service}.{api_name}")
-            
+                if page_count >= max_pages:
+                    truncated = True
+                    break
+
+            if truncated:
+                # Returning the partial count here would understate usage and could
+                # hide a quota breach ("silently healthy"). Return None so the quota
+                # is reported as unknown/degraded rather than falsely under-utilized.
+                logger.error(
+                    f"Pagination cap ({max_pages} pages) hit for {service}.{api_name}; "
+                    f"usage count is incomplete and will be reported as unavailable"
+                )
+                return None
+
             return total_count
-            
+
         except Exception as e:
             logger.error(f"Error counting via pagination for {service}.{api_name}: {sanitize_log(str(e))}")
             return None
@@ -2554,27 +2693,33 @@ class ConnectQuotaMonitor:
             # Fallback to original implementation
             all_resources = []
             next_token = None
-            max_pages = 100
+            max_pages = 500  # Safety bound; set high enough not to truncate real data
             page_count = 0
-            
-            while page_count < max_pages:
+
+            while True:
                 api_params = params.copy()
                 if next_token:
                     api_params['NextToken'] = next_token
-                
+
                 response = self.call_service_api(service, api_name, **api_params)
                 if not response:
                     break
-                
+
                 items = response.get(response_key, [])
                 all_resources.extend(items)
-                
+
                 next_token = response.get('NextToken')
                 if not next_token:
                     break
-                
+
                 page_count += 1
-            
+                if page_count >= max_pages:
+                    logger.error(
+                        f"Pagination cap ({max_pages} pages) hit for {service}.{api_name}; "
+                        f"resource list is incomplete ({len(all_resources)} so far)"
+                    )
+                    break
+
             return all_resources
             
         except Exception as e:
@@ -2615,6 +2760,15 @@ class ConnectQuotaMonitor:
         """Get the current AWS account ID."""
         try:
             if not hasattr(self, '_account_id'):
+                # Guard against re-entrancy: the ARN fallback below calls
+                # get_connect_instances(), whose metadata enrichment calls
+                # _get_account_id() again. Without this guard that recurses
+                # until (or past) the recursion limit. Returning 'unknown' on
+                # re-entry breaks the cycle; the outer call still resolves the
+                # real value from the instance ARN.
+                if getattr(self, '_account_id_resolving', False):
+                    return 'unknown'
+
                 # Get account ID from STS
                 sts_client = self.get_service_client('sts')
                 if sts_client:
@@ -2622,7 +2776,11 @@ class ConnectQuotaMonitor:
                     self._account_id = response.get('Account')
                 else:
                     # Fallback: extract from instance ARN if available
-                    instances = self.get_connect_instances()
+                    self._account_id_resolving = True
+                    try:
+                        instances = self.get_connect_instances()
+                    finally:
+                        self._account_id_resolving = False
                     if instances:
                         instance_arn = instances[0].get('Arn', '')
                         # ARN format: arn:aws:connect:region:account-id:instance/instance-id
@@ -3433,13 +3591,13 @@ class AlertConsolidationEngine:
 
             for violation in category_violations:
                 message_lines.extend([
-                    f"╔═══════════════════════════════════════════════════════════",
+                    "╔═══════════════════════════════════════════════════════════",
                     f"║ ⚠️  ALERT: {violation['quota_name'].upper()}",
-                    f"║",
+                    "║",
                     f"║    ▶ CURRENT USAGE: {violation['current_usage']:,}",
                     f"║    ▶ QUOTA LIMIT:   {violation['quota_limit']:,}",
                     f"║    ▶ UTILIZATION:   {violation['utilization_percentage']:.1f}% ⚠️  ⚠️  ⚠️",
-                    f"╚═══════════════════════════════════════════════════════════",
+                    "╚═══════════════════════════════════════════════════════════",
                     ""
                 ])
 
@@ -3470,7 +3628,10 @@ class AlertConsolidationEngine:
                 
                 for quota in category_quotas:
                     utilization = quota.get('utilization_percentage', 0)
-                    status_icon = "⚠️ " if utilization > self.threshold_percentage else "✅"
+                    # Use >= to match the violation-detection threshold, so a quota
+                    # at exactly the threshold isn't flagged as a violation yet shown
+                    # with a ✅ in the same alert.
+                    status_icon = "⚠️ " if utilization >= self.threshold_percentage else "✅"
                     
                     message_lines.extend([
                         f"{status_icon} {quota['quota_name']}",
@@ -3531,19 +3692,40 @@ class AlertConsolidationEngine:
             sms_message = f"Connect Alert: {message_data['violations_count']} quota violation(s) detected"
             if message_data['scope'] == 'INSTANCE':
                 sms_message += f" for {message_data.get('instance_alias', 'instance')}"
-            
-            # Send structured message
-            response = self.sns_client.publish(
-                TopicArn=self.topic_arn,
-                Message=json.dumps({
+
+            # SNS Subject must be ASCII, single-line, and <= 100 characters, or the
+            # publish is rejected. Collapse newlines and truncate defensively.
+            safe_subject = ' '.join(str(subject).split())[:100]
+
+            # Send structured message. NOTE: with MessageStructure='json', every key
+            # other than "default" must be a valid SNS transport protocol name.
+            # "json" is not a protocol, so including it makes SNS reject the whole
+            # publish (InvalidParameter) and no alert is delivered. The structured
+            # payload is carried as a message attribute instead (read by SQS/Lambda
+            # subscribers; email/SMS only see the Message body below).
+            publish_kwargs = {
+                'TopicArn': self.topic_arn,
+                'Message': json.dumps({
                     "default": human_message,
                     "email": human_message,
                     "sms": sms_message,
-                    "json": json.dumps(message_data)
                 }),
-                Subject=subject,
-                MessageStructure='json'
-            )
+                'Subject': safe_subject,
+                'MessageStructure': 'json',
+            }
+            # SNS caps Message + all attributes at 256 KB. The human-readable body
+            # already carries the alert; only attach the structured payload as an
+            # attribute if it comfortably fits, else drop it (a truncated JSON blob
+            # is useless to a consumer) rather than losing the whole alert.
+            structured = json.dumps(message_data)
+            if len(structured.encode('utf-8')) <= 200 * 1024:
+                publish_kwargs['MessageAttributes'] = {
+                    "structured_data": {"DataType": "String", "StringValue": structured}
+                }
+            else:
+                logger.warning("structured_data payload too large for SNS attribute; omitting it from the alert")
+
+            response = self.sns_client.publish(**publish_kwargs)
             
             logger.info(f"Consolidated alert sent successfully: {subject}")
             logger.debug(f"SNS Message ID: {response.get('MessageId')}")
@@ -3568,7 +3750,7 @@ class AlertConsolidationEngine:
                 return False, "Invalid SNS topic ARN format"
             
             # Test topic accessibility
-            response = self.sns_client.get_topic_attributes(TopicArn=self.topic_arn)
+            self.sns_client.get_topic_attributes(TopicArn=self.topic_arn)
             
             # Check if topic has subscriptions
             subscriptions = self.sns_client.list_subscriptions_by_topic(TopicArn=self.topic_arn)
@@ -3756,13 +3938,13 @@ def cli_main():
             sys.exit(1)
         
         # Print summary with secure output handling
-        print(f"\nConnect Service Quota Utilization Summary:")
+        print("\nConnect Service Quota Utilization Summary:")
         print(f"{'Instance':<20} {'Quota':<40} {'Usage':<10} {'Limit':<10} {'Utilization':<10}")
         print("-" * 90)
         
         # Results are already processed with alerts and storage
         # Print summary
-        print(f"\nConnect Service Quota Monitoring Summary:")
+        print("\nConnect Service Quota Monitoring Summary:")
         print(f"Instances monitored: {results.get('instances_monitored', 0)}")
         print(f"Total quotas checked: {results.get('total_quotas_checked', 0)}")
         print(f"Violations found: {results.get('violations_found', 0)}")

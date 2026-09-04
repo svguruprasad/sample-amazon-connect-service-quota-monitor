@@ -10,8 +10,8 @@ Peak-hour aware: Uses CloudWatch Maximum statistic to catch per-minute spikes, n
 
 import boto3
 import json
-from datetime import datetime, timedelta
-from typing import Dict, List, Any
+from datetime import datetime, timedelta, timezone
+from typing import Dict, Any
 
 cloudwatch = boto3.client('cloudwatch')
 sns = boto3.client('sns')
@@ -118,7 +118,7 @@ def get_peak_utilization(hours: int = 1) -> Dict[str, Any]:
     Returns:
         Dict with per-API utilization vs quota limit
     """
-    end_time = datetime.utcnow()
+    end_time = datetime.now(timezone.utc)
     start_time = end_time - timedelta(hours=hours)
 
     # Step 1: Get rate limits from Service Quotas
@@ -130,7 +130,6 @@ def get_peak_utilization(hours: int = 1) -> Dict[str, Any]:
     print(f"Fetched {len(rate_limits)} API rate limits from Service Quotas")
 
     # Step 2: For each API with a known limit, get peak usage from AWS/Usage
-    results = {}
     # Build batch query — up to 500 metrics per GetMetricData call
     queries = []
     api_index = {}
@@ -299,7 +298,7 @@ def send_utilization_alert(utilization: Dict[str, Any], sns_topic_arn: str):
         "             - GetCurrentMetricData: reduce polling frequency",
         "             - Write APIs: batch multiple updates per call",
         "",
-        f"  Report generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}",
+        f"  Report generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}",
     ])
 
     try:
@@ -323,7 +322,7 @@ def get_api_throttling_metrics(hours: int = 1) -> Dict[str, Any]:
     Returns:
         Dictionary with throttling statistics per API
     """
-    end_time = datetime.utcnow()
+    end_time = datetime.now(timezone.utc)
     start_time = end_time - timedelta(hours=hours)
     
     results = {}
@@ -399,7 +398,7 @@ def get_api_call_volume(hours: int = 1) -> Dict[str, Any]:
     Returns:
         Dictionary with API call statistics including peak rates
     """
-    end_time = datetime.utcnow()
+    end_time = datetime.now(timezone.utc)
     start_time = end_time - timedelta(hours=hours)
     
     results = {}
@@ -535,10 +534,10 @@ def send_throttling_alert(throttling: Dict, rates: Dict, sns_topic_arn: str):
     message_parts = [
         "Amazon Connect API Throttling Alert",
         "=" * 60,
-        f"\nOverall Throttling:",
+        "\nOverall Throttling:",
         f"  Total Throttled Calls: {total_throttled}",
         f"  Overall Throttle Rate: {overall_rate:.2f}%",
-        f"\nAffected APIs:",
+        "\nAffected APIs:",
     ]
     
     # Add details for each throttled API
@@ -555,21 +554,23 @@ def send_throttling_alert(throttling: Dict, rates: Dict, sns_topic_arn: str):
         )
     
     message_parts.extend([
-        f"\n\n" + "=" * 60,
+        "\n\n" + "=" * 60,
         "\nRecommended Actions:",
         "1. Review application logs for retry logic",
         "2. Implement exponential backoff",
         "3. Consider request rate optimization",
         "4. Request quota increase if needed",
-        "\nTime: " + datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
+        "\nTime: " + datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
     ])
     
     message = "\n".join(message_parts)
     
     try:
+        # SNS Subject must be single-line and <= 100 chars or publish is rejected.
+        safe_subject = " ".join(str(subject).split())[:100]
         response = sns.publish(
             TopicArn=sns_topic_arn,
-            Subject=subject,
+            Subject=safe_subject,
             Message=message
         )
         print(f"Alert sent successfully. MessageId: {response['MessageId']}")
@@ -609,11 +610,11 @@ def main(event, context):
     if not utilization_topic:
         utilization_topic = throttle_topic
     
-    print(f"Starting API throttling monitor (Proactive Utilization + Throttle Detection)...")
+    print("Starting API throttling monitor (Proactive Utilization + Throttle Detection)...")
     print(f"Lookback period: {hours} hours")
     
     result = {
-        'timestamp': datetime.utcnow().isoformat(),
+        'timestamp': datetime.now(timezone.utc).isoformat(),
         'period_hours': hours,
     }
 
