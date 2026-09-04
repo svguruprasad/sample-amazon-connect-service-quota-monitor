@@ -2,8 +2,6 @@
 
 **Get an email alert before your Connect quotas breach — not after calls start dropping.**
 
-> **See what the dashboard looks like:** Open [docs/screenshots/sample-dashboard.html](docs/screenshots/sample-dashboard.html) in your browser for a live interactive preview with sample data.
-
 ---
 
 ## What this does
