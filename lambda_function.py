@@ -178,7 +178,6 @@ else:
 }
 
 # Maintain backward compatibility with existing code
-CONNECT_QUOTA_METRICS = ENHANCED_CONNECT_QUOTA_METRICS
 
 # Quota categories for organization and filtering
 QUOTA_CATEGORIES = {
@@ -198,17 +197,6 @@ QUOTA_CATEGORIES = {
     'AGENT_SCHEDULING': 'Agent & Scheduling',
     'API_RATE_LIMITS': 'API Rate Limits'
 }
-
-def get_quotas_by_category(category=None):
-    """Get quotas filtered by category."""
-    if category is None:
-        return ENHANCED_CONNECT_QUOTA_METRICS
-    
-    return {
-        quota_code: config 
-        for quota_code, config in ENHANCED_CONNECT_QUOTA_METRICS.items()
-        if config.get('category') == category
-    }
 
 def get_quotas_by_scope(scope=None):
     """Get quotas filtered by scope (ACCOUNT or INSTANCE)."""
@@ -1167,19 +1155,6 @@ class ConnectQuotaMonitor:
             status = instance.get('InstanceStatus', 'Unknown')
             logger.info(f"  Instance: {alias} ({instance_id}) - Status: {status}")
     
-    def refresh_instance_cache(self):
-        """Force refresh of the instance cache."""
-        logger.info("Forcing refresh of Connect instance cache")
-        return self.get_connect_instances(force_refresh=True)
-    
-    def get_instance_by_id(self, instance_id):
-        """Get a specific instance by ID."""
-        instances = self.get_connect_instances()
-        for instance in instances:
-            if instance.get('Id') == instance_id:
-                return instance
-        return None
-    
     def get_active_instances(self):
         """Get only active Connect instances."""
         instances = self.get_connect_instances()
@@ -1828,53 +1803,6 @@ class ConnectQuotaMonitor:
             }
         
         return status
-    
-    def send_alert(self, topic_arn, quota_info):
-        """Legacy send_alert method for backward compatibility."""
-        logger.warning("Using legacy send_alert method. Consider using monitor_and_alert() for consolidated alerts.")
-        
-        # Create temporary alert engine
-        alert_engine = AlertConsolidationEngine(self.sns_client, topic_arn, self.threshold_percentage or THRESHOLD_PERCENTAGE)
-        
-        # Convert legacy format to new format
-        violations = [{
-            'quota_code': quota_info.get('quota_info', {}).get('quota_code', 'unknown'),
-            'quota_name': quota_info.get('quota_info', {}).get('quota_name', 'Unknown Quota'),
-            'current_usage': quota_info.get('quota_info', {}).get('current_value', 0),
-            'quota_limit': quota_info.get('quota_info', {}).get('quota_value', 0),
-            'utilization_percentage': quota_info.get('quota_info', {}).get('utilization_percentage', 0),
-            'category': 'LEGACY'
-        }]
-        
-        # Send consolidated alert
-        return alert_engine._send_instance_consolidated_alert(
-            quota_info.get('instance_id', 'unknown'),
-            {'instance_alias': quota_info.get('instance_name', 'Unknown Instance')},
-            violations
-        )
-    
-    def get_service_quotas(self):
-        """Get Amazon Connect service quotas."""
-        quotas = []
-        try:
-            paginator = self.service_quotas_client.get_paginator('list_service_quotas')
-            
-            for page in paginator.paginate(ServiceCode='connect'):
-                quotas.extend(page['Quotas'])
-                
-            # Filter to include only the quotas we know how to monitor
-            monitorable_quotas = [q for q in quotas if q['QuotaCode'] in CONNECT_QUOTA_METRICS]
-            
-            logger.info(f"Found {len(monitorable_quotas)} monitorable Connect service quotas out of {len(quotas)} total")
-            return monitorable_quotas
-            
-        except ClientError as e:
-            error_code = e.response['Error']['Code']
-            error_msg = e.response['Error']['Message']
-            logger.error(f"Failed to list service quotas: {error_code} - {sanitize_log(error_msg)}")
-            if error_code == 'AccessDeniedException':
-                logger.error("Insufficient permissions to list service quotas. Check IAM permissions.")
-            raise
     
     def get_quota_utilization(self, instance_id, quota_config, quota_code=None):
         """
@@ -3766,28 +3694,6 @@ class AlertConsolidationEngine:
             return False, f"SNS validation failed: {error_code}"
         except Exception as e:
             return False, f"SNS validation error: {sanitize_log(str(e))}"
-
-    def send_alert(self, topic_arn, quota_info):
-        """Legacy method for backward compatibility."""
-        logger.warning("Using legacy send_alert method. Consider using AlertConsolidationEngine for better consolidation.")
-        
-        # Convert legacy format to new format
-        violations = [{
-            'quota_code': quota_info['quota_info']['quota_code'],
-            'quota_name': quota_info['quota_info']['quota_name'],
-            'current_usage': quota_info['quota_info']['current_value'],
-            'quota_limit': quota_info['quota_info']['quota_value'],
-            'utilization_percentage': quota_info['quota_info']['utilization_percentage'],
-            'category': 'LEGACY'
-        }]
-        
-        # Use new consolidation engine
-        temp_engine = AlertConsolidationEngine(self.sns_client, topic_arn, self.threshold_percentage)
-        return temp_engine._send_instance_consolidated_alert(
-            quota_info['instance_id'],
-            {'instance_alias': quota_info['instance_name']},
-            violations
-        )
 
 def validate_sns_topic(sns_client, topic_arn):
     """Validate that the SNS topic exists and is accessible."""
