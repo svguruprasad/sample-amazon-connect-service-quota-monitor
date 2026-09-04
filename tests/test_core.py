@@ -119,6 +119,11 @@ class TestDashboardXss:
         assert 'onclick="selectFlow' not in html
         assert 'data-action="select-line"' in html
         assert 'data-action="select-flow"' in html
+        # Headroom math divides by capacity-used %, which is 0 on an idle line.
+        # The guarded headroom() helper must be present so the UI shows a dash
+        # instead of "InfinityM" / "NaN".
+        assert "function headroom(" in html
+        assert "Math.round(line.today / line.capacityPct" not in html
         # The delegated listeners must actually be wired, else the markup is inert
         # (data- attributes present but nothing clickable) — this would otherwise be
         # a silent regression that the assertions above wouldn't catch.

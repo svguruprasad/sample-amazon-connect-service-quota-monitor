@@ -1076,7 +1076,7 @@ function renderLineDetail(line) {{
       <div class="chart-header"><h2>Capacity Status</h2></div>
       ${{renderCapacityCard(line)}}
       <div style="font-size:11px;color:var(--muted);margin-top:8px;">
-        You can handle <strong style="color:var(--text)">${{formatNum(Math.round(vol / line.capacityPct * (100 - line.capacityPct)))}}</strong> more calls ${{timeLabel}} before degradation on this line.
+        You can handle <strong style="color:var(--text)">${{headroom(vol, line.capacityPct)}}</strong> more calls ${{timeLabel}} before degradation on this line.
       </div>
     </div>
     <div class="drill-section">
@@ -1264,12 +1264,11 @@ function renderHourChart(hourly) {{
 function renderCapacityCard(line) {{
   const pct = line.capacityPct;
   const color = pct > 80 ? 'var(--red)' : pct > 60 ? 'var(--yellow)' : 'var(--green)';
-  const remaining = Math.round(line.today / pct * (100 - pct));
   return `
     <div class="capacity-card" data-action="select-line" data-id="${{esc(line.id)}}" role="button" tabindex="0" aria-label="Select line ${{esc(line.name)}}">
       <div class="cap-header"><span class="cap-name">${{esc(line.name)}}</span><span class="cap-pct" style="color:${{color}}">${{pct}}%</span></div>
       <div class="cap-bar"><div class="fill" style="width:${{pct}}%;background:${{color}}"></div></div>
-      <div class="cap-remaining">Can handle <strong>${{formatNum(remaining)}}</strong> more calls today</div>
+      <div class="cap-remaining">Can handle <strong>${{headroom(line.today, pct)}}</strong> more calls today</div>
     </div>
   `;
 }}
@@ -1291,7 +1290,7 @@ function renderDetailPanel() {{
     <div class="detail-card">
       <h4>Capacity</h4>
       <div class="detail-row"><span class="label">Current utilization</span><span class="value">${{line.capacityPct}}%</span></div>
-      <div class="detail-row"><span class="label">Remaining headroom</span><span class="value">${{formatNum(Math.round(line.today / line.capacityPct * (100 - line.capacityPct)))}} calls</span></div>
+      <div class="detail-row"><span class="label">Remaining headroom</span><span class="value">${{headroom(line.today, line.capacityPct)}} calls</span></div>
     </div>
     <div class="detail-card">
       <h4>7-Day Volume</h4>
@@ -1399,7 +1398,12 @@ function clearApiSliders() {{
   renderContent();
 }}
 function aggregateHourly() {{ const agg = new Array(24).fill(0); LINES.forEach(l => l.hourly.forEach((v, i) => agg[i] += v)); return agg; }}
-function formatNum(n) {{ if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M'; if (n >= 1000) return (n / 1000).toFixed(0) + 'K'; return n.toLocaleString(); }}
+function formatNum(n) {{ if (!isFinite(n)) return '—'; if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M'; if (n >= 1000) return (n / 1000).toFixed(0) + 'K'; return n.toLocaleString(); }}
+// Headroom = how many more calls fit before the line hits capacity. It is
+// derived from current volume and percent-used, so it is undefined when the
+// line has no measured utilization yet (percent-used is 0). Show a dash then
+// rather than Infinity or NaN.
+function headroom(vol, pct) {{ return (pct > 0 && isFinite(vol)) ? formatNum(Math.round(vol / pct * (100 - pct))) : '—'; }}
 
 function render() {{ renderHealthStrip(); renderContent(); renderDetailPanel(); }}
 render();
