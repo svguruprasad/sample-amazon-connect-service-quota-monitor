@@ -174,12 +174,11 @@ class TestCFNTemplate:
         import re
         template_path = Path(__file__).parent.parent / "connect-quota-monitor-cfn.yaml"
         content = template_path.read_text()
-        # 12-digit sequences that aren't inside ${} or !Sub references
-        matches = re.findall(r"\b\d{12}\b", content)
-        # Filter: CFN templates legitimately use 12-digit numbers in some contexts
-        # But real account IDs like 745351468190 should not be present
-        real_ids = [m for m in matches if m.startswith("7") or m.startswith("9")]
-        assert len(real_ids) == 0, f"Possible hardcoded account IDs: {real_ids}"
+        # Any 12-digit sequence that is not a well-known documentation placeholder
+        # is treated as a possible real account ID.
+        placeholders = {"000000000000", "123456789012"}
+        real_ids = [m for m in re.findall(r"\b\d{12}\b", content) if m not in placeholders]
+        assert real_ids == [], f"Possible hardcoded account IDs: {real_ids}"
 
 
 class TestNoHardcodedSecrets:
@@ -197,18 +196,20 @@ class TestNoHardcodedSecrets:
                 f"Possible AWS key in {py_file.name}"
 
     def test_no_hardcoded_instance_ids_in_source(self):
-        """No real Connect instance IDs in committed source (test files use placeholders)."""
-        # The instance ID pattern to detect (split to avoid self-match)
-        forbidden_prefix = "6c3f17c0" + "-3b52-4990"
+        """No real Connect instance ID in committed source. The specific value to
+        scan for is supplied via the FORBIDDEN_INSTANCE_ID env var (never
+        committed), so this test file does not itself embed the identifier it
+        guards against. Set it locally or in CI to scan a known dev instance."""
+        import os
+        forbidden = os.environ.get("FORBIDDEN_INSTANCE_ID", "").strip()
+        if not forbidden:
+            import pytest
+            pytest.skip("Set FORBIDDEN_INSTANCE_ID to scan source for a specific instance ID")
         root = Path(__file__).parent.parent
         for py_file in root.rglob("*.py"):
             if ".git" in str(py_file) or "__pycache__" in str(py_file) or "output" in str(py_file):
                 continue
-            if py_file.name == "test_core.py":
-                continue
-            content = py_file.read_text()
-            if forbidden_prefix in content:
-                assert False, f"Hardcoded instance ID in {py_file.name}"
+            assert forbidden not in py_file.read_text(), f"Hardcoded instance ID in {py_file.name}"
 
 
 class TestCloudWatchMonitoring:
