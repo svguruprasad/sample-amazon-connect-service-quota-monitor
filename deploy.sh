@@ -604,7 +604,7 @@ display_deployment_summary() {
     echo "   ✅ Dynamic instance discovery (no hardcoded references)"
     echo "   ✅ Consolidated alerting (one email per instance)"
     echo "   ✅ Flexible storage (S3 and/or DynamoDB)"
-    echo "   ✅ Multi-service support (Cases, Profiles, Voice ID, Wisdom, etc.)"
+    echo "   ✅ Multi-service support (Connect, Cases, Campaigns, Participant)"
     echo "   ✅ Intelligent deployment with S3 fallback"
     echo "   ✅ Post-deployment configuration flexibility"
     echo ""

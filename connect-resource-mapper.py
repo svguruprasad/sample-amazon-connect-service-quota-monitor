@@ -14,16 +14,12 @@ Outputs:
     connect-dashboard.html            Self-contained interactive dashboard
     connect-api-report.html           Consolidated per-API / per-flow report
 
-Required IAM Permissions (read-only):
+Required IAM Permissions (read-only, matching the APIs actually called):
     connect:ListContactFlows, connect:DescribeContactFlow,
-    connect:ListPhoneNumbersV2, connect:ListQueues,
-    connect:ListRoutingProfiles, connect:ListLambdaFunctions,
-    connect:ListTrafficDistributionGroups,
-    connect:DescribeTrafficDistributionGroup,
-    connect:GetTrafficDistribution,
-    lambda:ListFunctions, lambda:GetFunction,
-    lambda:ListProvisionedConcurrencyConfigs,
-    lex:ListBots, lex:ListBotAliases,
+    connect:ListPhoneNumbersV2, connect:ListLambdaFunctions,
+    connect:ListTrafficDistributionGroups, connect:GetTrafficDistribution,
+    lambda:GetFunction, lambda:ListProvisionedConcurrencyConfigs,
+    lex:ListBots,
     servicequotas:ListServiceQuotas,
     cloudwatch:GetMetricData
 
@@ -35,7 +31,7 @@ Usage:
         --output-dir ./output
 
 Author: Amazon.com, Inc.
-License: MIT
+License: MIT-0
 """
 
 from __future__ import annotations

@@ -72,23 +72,28 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     if not instance_id:
         return _response(400, {"error": "CONNECT_INSTANCE_ID not configured"})
 
-    # Determine if this is an API Gateway request or a scheduled event
+    # An API Gateway proxy request always carries a requestContext; a scheduled
+    # EventBridge invocation never does. Only the schedule is allowed to run the
+    # expensive resource-map crawl and write to S3. The public API path is
+    # strictly read-only so an unauthenticated caller cannot drive the crawl or
+    # S3 writes (see the security note on DashboardApi in template.yaml).
+    is_api_request = "requestContext" in event
+
+    if not is_api_request:
+        # Scheduled collection: crawl + write. This is the only writer.
+        snapshot = _collect_snapshot(instance_id)
+        if bucket:
+            _write_latest(bucket, snapshot)
+            _write_archive(bucket, snapshot)
+            _update_peak(bucket, snapshot)
+        return _response(200, snapshot)
+
+    # Public API Gateway request: read-only. Never collects, crawls, or writes.
     params = event.get("queryStringParameters") or {}
     history = params.get("history", "")
-
-    # If history requested, serve from archive (no new collection)
     if history:
         return _serve_history(bucket, history)
-
-    # Otherwise: collect fresh data, write to S3, return latest
-    snapshot = _collect_snapshot(instance_id)
-
-    if bucket:
-        _write_latest(bucket, snapshot)
-        _write_archive(bucket, snapshot)
-        _update_peak(bucket, snapshot)
-
-    return _response(200, snapshot)
+    return _serve_latest(bucket)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -242,7 +247,11 @@ def _get_quota_limits(sq: Any) -> dict[str, float]:
                 # Match "Rate of X API requests" pattern
                 for api_name in HIGH_TRAFFIC_APIS:
                     if api_name in name:
-                        limits[api_name] = quota.get("Value", 2)
+                        # .get(key, default) only substitutes when the key is
+                        # absent, not when Value is explicitly null; coerce None
+                        # to the default so downstream arithmetic never sees None.
+                        value = quota.get("Value")
+                        limits[api_name] = value if value is not None else 2
                         break
     except ClientError as e:
         logger.warning("ServiceQuotas query failed: %s", e)
@@ -389,6 +398,24 @@ def _update_peak(bucket: str, snapshot: dict[str, Any]) -> None:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+def _serve_latest(bucket: str) -> dict[str, Any]:
+    """Return the most recent snapshot written by the scheduled collector.
+
+    The public GET /quota path is read-only: it serves the cached latest.json
+    rather than triggering a fresh collection, so an unauthenticated caller can
+    never drive the resource-map crawl or the S3 writes. Matches the documented
+    contract ("GET /quota -> latest snapshot, same as latest.json").
+    """
+    if not bucket:
+        return _response(503, {"error": "No report bucket configured; snapshot unavailable"})
+    s3 = boto3.client("s3")
+    try:
+        obj = s3.get_object(Bucket=bucket, Key="latest.json")
+        return _response(200, json.loads(obj["Body"].read()))
+    except ClientError:
+        return _response(503, {"error": "Snapshot not yet available; the scheduled collector runs on its configured schedule"})
+
+
 def _serve_history(bucket: str, history: str) -> dict[str, Any]:
     """Serve historical data from archive/peaks folders.
 
@@ -400,7 +427,7 @@ def _serve_history(bucket: str, history: str) -> dict[str, Any]:
         API Gateway response with historical entries.
     """
     if not bucket:
-        return _response(400, {"error": "S3_BUCKET not configured for history"})
+        return _response(400, {"error": "S3_REPORT_BUCKET not configured for history"})
 
     s3 = boto3.client("s3")
     now = datetime.now(timezone.utc)
@@ -450,8 +477,10 @@ def _list_archive_entries(s3: Any, bucket: str, start: datetime, end: datetime) 
                         entries.append(entry)
                 except (ValueError, IndexError):
                     continue
-        except ClientError:
-            pass
+        except ClientError as e:
+            # Commonly AccessDenied when the role lacks s3:ListBucket; log it so
+            # an empty history result is not mistaken for "no data".
+            logger.warning("Could not list archive for %s: %s", prefix, e)
 
         current += timedelta(days=1)
 

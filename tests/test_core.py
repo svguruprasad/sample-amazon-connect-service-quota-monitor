@@ -461,6 +461,130 @@ class TestApiRetryBackoff:
         assert type(client).calls == 3, "throttling should retry up to max_retries"
 
 
+class TestServiceQuotaMapCaching:
+    """Regression: a failed/partial ListServiceQuotas page must not be cached,
+    or real applied limits are shadowed by defaults for the whole 5-min TTL."""
+
+    def _make_monitor(self):
+        from lambda_function import ConnectQuotaMonitor
+        m = ConnectQuotaMonitor.__new__(ConnectQuotaMonitor)
+        m.region = "us-east-1"
+        return m
+
+    def test_partial_pagination_not_cached(self):
+        monitor = self._make_monitor()
+        calls = {"n": 0}
+
+        def fake_call(service, api, **kwargs):
+            calls["n"] += 1
+            if "NextToken" in kwargs:
+                return None  # page 2 fails / throttles out
+            return {"Quotas": [{"QuotaCode": "L-1", "Value": 5.0}], "NextToken": "tok"}
+
+        monitor.call_service_api = fake_call
+        first = monitor._get_service_quota_map("connect")
+        assert "L-1" in first, "partial data is still returned for this call"
+        n_after_first = calls["n"]
+        monitor._get_service_quota_map("connect")
+        assert calls["n"] > n_after_first, "a partial/failed map must not be cached"
+
+    def test_complete_map_is_cached(self):
+        monitor = self._make_monitor()
+        calls = {"n": 0}
+
+        def fake_call(service, api, **kwargs):
+            calls["n"] += 1
+            return {"Quotas": [{"QuotaCode": "L-1", "Value": 5.0}]}  # no NextToken -> complete
+
+        monitor.call_service_api = fake_call
+        monitor._get_service_quota_map("connect")
+        n = calls["n"]
+        monitor._get_service_quota_map("connect")
+        assert calls["n"] == n, "a complete map should be cached (no re-fetch within TTL)"
+
+
+class TestApiCountDispatch:
+    """Regression: describe_user_hierarchy_structure has no pagination response
+    key, so it must be dispatched to its counter BEFORE the response-key lookup,
+    or the quota is silently skipped (returns None)."""
+
+    def _make_monitor(self):
+        from lambda_function import ConnectQuotaMonitor
+        m = ConnectQuotaMonitor.__new__(ConnectQuotaMonitor)
+        m.region = "us-east-1"
+        return m
+
+    def test_hierarchy_structure_reaches_counter(self):
+        monitor = self._make_monitor()
+
+        def fake_call(service, api, **kwargs):
+            assert api == "describe_user_hierarchy_structure"
+            return {"HierarchyStructure": {
+                "LevelOne": {"Name": "L1"},
+                "LevelTwo": {"Name": "L2"},
+            }}
+
+        monitor.call_service_api = fake_call
+        count = monitor._monitor_via_api_count(
+            "inst-1", {"service": "connect", "api": "describe_user_hierarchy_structure"}
+        )
+        assert count == 2, f"expected 2 hierarchy levels, got {count} (dispatch regressed?)"
+
+
+class TestLiveRefreshHandler:
+    """The public API path must be read-only: an API Gateway GET must never
+    trigger the resource-map crawl or S3 writes; only the schedule may write."""
+
+    def _load(self):
+        import importlib.util
+        path = Path(__file__).parent.parent / "live-refresh" / "lambda_function.py"
+        spec = importlib.util.spec_from_file_location("live_refresh_lambda", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_api_request_is_read_only(self, monkeypatch):
+        mod = self._load()
+        monkeypatch.setenv("CONNECT_INSTANCE_ID", "inst-1")
+        monkeypatch.setenv("S3_REPORT_BUCKET", "bucket")
+        seen = {"serve_latest": 0, "write": 0, "collect": 0}
+
+        def _serve_latest(bucket):
+            seen["serve_latest"] += 1
+            return {"statusCode": 200, "body": "{}"}
+
+        def _boom_write(*a, **k):
+            seen["write"] += 1
+
+        def _boom_collect(*a, **k):
+            seen["collect"] += 1
+            return {}
+
+        monkeypatch.setattr(mod, "_serve_latest", _serve_latest)
+        monkeypatch.setattr(mod, "_write_latest", _boom_write)
+        monkeypatch.setattr(mod, "_collect_snapshot", _boom_collect)
+        # An API Gateway proxy request always carries requestContext.
+        mod.lambda_handler({"requestContext": {}, "queryStringParameters": None}, None)
+        assert seen["serve_latest"] == 1, "API GET must serve latest.json (read-only)"
+        assert seen["write"] == 0, "API GET must not write to S3"
+        assert seen["collect"] == 0, "API GET must not run a fresh collection/crawl"
+
+    def test_scheduled_event_collects_and_writes(self, monkeypatch):
+        mod = self._load()
+        monkeypatch.setenv("CONNECT_INSTANCE_ID", "inst-1")
+        monkeypatch.setenv("S3_REPORT_BUCKET", "bucket")
+        seen = {"write": 0, "collect": 0}
+
+        monkeypatch.setattr(mod, "_collect_snapshot", lambda *a, **k: seen.__setitem__("collect", seen["collect"] + 1) or {"quotas": []})
+        monkeypatch.setattr(mod, "_write_latest", lambda *a, **k: seen.__setitem__("write", seen["write"] + 1))
+        monkeypatch.setattr(mod, "_write_archive", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_update_peak", lambda *a, **k: None)
+        # A scheduled EventBridge event has no requestContext.
+        mod.lambda_handler({}, None)
+        assert seen["collect"] == 1, "scheduled run must collect"
+        assert seen["write"] == 1, "scheduled run must write latest.json"
+
+
 class TestPaginationCounting:
     """Regression: C6 — hitting the pagination safety cap must not silently return
     a truncated (falsely-low) count that hides a quota breach."""

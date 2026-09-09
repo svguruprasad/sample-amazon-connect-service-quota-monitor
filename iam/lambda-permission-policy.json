@@ -9,7 +9,6 @@
         "connect:Describe*",
         "connect:Get*",
         "servicequotas:ListServiceQuotas",
-        "servicequotas:GetServiceQuota",
         "cloudwatch:GetMetricData",
         "cloudwatch:GetMetricStatistics"
       ],

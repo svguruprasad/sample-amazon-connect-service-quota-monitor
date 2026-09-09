@@ -194,7 +194,10 @@ is_valid, validation_errors = validate_quota_configuration()
 if not is_valid:
     logger.warning(f"Quota configuration has validation errors: {validation_errors}")
 
-logger.info(f"Enhanced Connect Quota Monitor initialized with {len(ENHANCED_CONNECT_QUOTA_METRICS)} quota definitions across {len(QUOTA_CATEGORIES)} categories")
+# Count categories that actually have quotas mapped to them, not the full list
+# of allowed category labels (QUOTA_CATEGORIES declares more than are in use).
+_active_categories = {q.get("category") for q in ENHANCED_CONNECT_QUOTA_METRICS.values() if q.get("category")}
+logger.info(f"Enhanced Connect Quota Monitor initialized with {len(ENHANCED_CONNECT_QUOTA_METRICS)} quota definitions across {len(_active_categories)} categories")
 
 class MultiServiceClientManager:
     """
@@ -1829,6 +1832,7 @@ class ConnectQuotaMonitor:
             return cached[0]
 
         quotas = {}
+        complete = False
         try:
             next_token = None
             pages = 0
@@ -1838,6 +1842,10 @@ class ConnectQuotaMonitor:
                     params['NextToken'] = next_token
                 resp = self.call_service_api('service-quotas', 'list_service_quotas', **params)
                 if not resp:
+                    # A failed/throttled page leaves the map incomplete. Break
+                    # without marking complete so we do NOT cache a partial map
+                    # (caching it would silently shadow real applied limits with
+                    # documented defaults for 5 minutes and could hide breaches).
                     break
                 for q in resp.get('Quotas', []):
                     code = q.get('QuotaCode')
@@ -1846,14 +1854,25 @@ class ConnectQuotaMonitor:
                 next_token = resp.get('NextToken')
                 pages += 1
                 if not next_token:
+                    complete = True
                     break
         except Exception as e:
             # A service that is not registered with Service Quotas (or a denied
             # call) yields no map; callers fall back to the documented default.
             logger.warning(f"Could not list service quotas for '{service_code}': {sanitize_log(str(e))}")
 
-        self._service_quota_maps[service_code] = (quotas, datetime.now(timezone.utc))
-        logger.info(f"Loaded {len(quotas)} applied quotas for service '{service_code}'")
+        if complete:
+            # Only cache a fully-paginated result. An incomplete map is returned
+            # for this call but not cached, so the next call retries rather than
+            # serving defaults for the whole TTL window.
+            self._service_quota_maps[service_code] = (quotas, datetime.now(timezone.utc))
+            logger.info(f"Loaded {len(quotas)} applied quotas for service '{service_code}'")
+        else:
+            logger.warning(
+                f"Incomplete applied-quota map for service '{service_code}' "
+                f"({len(quotas)} loaded before a failed/truncated page); not caching, "
+                f"quotas may fall back to defaults this run"
+            )
         return quotas
 
     def _query_usage_from_usage_metric(self, usage_metric):
@@ -1904,7 +1923,18 @@ class ConnectQuotaMonitor:
         per service) so we use the customer's approved value rather than the
         documented default. Connect quotas are account/Region scoped in Service
         Quotas, so no per-instance ContextId lookup is made.
+
+        instance_id/context_required are accepted for call-site compatibility but
+        not used: every current quota is account/Region scoped. If a genuinely
+        resource-scoped quota is ever added (context_required=True), warn loudly
+        rather than silently return the account-level value.
         """
+        if context_required:
+            logger.warning(
+                f"Quota {quota_code} is marked context_required, but resource-scoped "
+                f"(ContextId) lookups are not implemented; returning the account/Region "
+                f"applied limit, which may be wrong for instance {instance_id}"
+            )
         quota = self._get_service_quota_map(service).get(quota_code)
         if quota and quota.get('Value') is not None:
             return float(quota['Value'])

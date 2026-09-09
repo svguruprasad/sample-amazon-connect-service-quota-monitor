@@ -104,10 +104,10 @@ Costs scale with `ScheduleRate`. At the default `rate(1 hour)` (24 runs/day,
 - cloudwatch:GetMetricData
 - cloudwatch:GetMetricStatistics
 - servicequotas:ListServiceQuotas
-- servicequotas:GetServiceQuota
-- s3:PutObject   # write latest.json, archive/, peaks/, index.html (report bucket)
-- s3:GetObject   # read line config and prior history (report bucket)
+- s3:PutObject    # write latest.json, archive/, peaks/, index.html (report bucket)
+- s3:GetObject    # read line config, latest.json, and peak history (report bucket)
+- s3:ListBucket   # list archive/ entries for GET /quota?history=1h|1d (report bucket)
 ```
 
-These are granted by `template.yaml` on the report bucket; the `s3:GetObject`
-for line config is only needed if you supply config via S3.
+These are granted by `template.yaml` on the report bucket; the line-config
+`s3:GetObject` is only needed if you supply config via S3.

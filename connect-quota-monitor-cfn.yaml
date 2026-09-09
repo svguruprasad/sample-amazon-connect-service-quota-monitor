@@ -578,8 +578,10 @@ Resources:
               - Sid: ServiceQuotasPermissions
                 Effect: Allow
                 Action:
+                  # GetServiceQuota removed: the monitor now batches applied
+                  # limits via ListServiceQuotas (one call per service) instead
+                  # of one GetServiceQuota per quota.
                   - servicequotas:ListServiceQuotas
-                  - servicequotas:GetServiceQuota
                   - servicequotas:ListServices
                 Resource: '*'
               
