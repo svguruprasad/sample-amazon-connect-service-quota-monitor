@@ -320,38 +320,34 @@ class TestCloudWatchMonitoring:
 
 
 class TestAppliedQuotaLookup:
-    """Regression: C7 — a context-aware lookup that fails must retry without the
-    ContextId instead of silently falling back to the hardcoded default."""
+    """Regression: applied limits come from a single batched ListServiceQuotas
+    per service (cached), never a per-quota GetServiceQuota call."""
 
     def _make_monitor(self):
         from lambda_function import ConnectQuotaMonitor
         m = ConnectQuotaMonitor.__new__(ConnectQuotaMonitor)
         m.region = "us-east-1"
-        m._quota_limit_cache = {}
-        m._get_account_id = lambda: "123456789012"
         return m
 
-    def test_context_failure_retries_without_context(self):
-        from botocore.exceptions import ClientError
+    def test_applied_limit_from_list_service_quotas(self):
         monitor = self._make_monitor()
         calls = []
 
         def fake_call(service, api, **kwargs):
-            calls.append(kwargs)
-            if "ContextId" in kwargs:
-                raise ClientError(
-                    {"Error": {"Code": "NoSuchResourceException", "Message": "x"}},
-                    "GetServiceQuota",
-                )
-            return {"Quota": {"Value": 75.0}}
+            calls.append((service, api))
+            if api == "list_service_quotas":
+                return {"Quotas": [{"QuotaCode": "L-D945C9A8", "Value": 75.0}]}
+            raise AssertionError(f"unexpected call {service}.{api}")
 
         monitor.call_service_api = fake_call
-        val = monitor._get_actual_quota_limit(
-            "connect", "L-D945C9A8", instance_id="inst-1", context_required=True
-        )
-        assert val == 75.0, f"expected applied value 75 from context-less retry, got {val}"
-        assert len(calls) == 2, "should have retried exactly once without context"
-        assert "ContextId" not in calls[1], "retry must omit ContextId"
+        val = monitor._get_actual_quota_limit("connect", "L-D945C9A8", instance_id="inst-1")
+        assert val == 75.0, f"expected applied value 75 from the batch map, got {val}"
+        assert all(api == "list_service_quotas" for _, api in calls), \
+            "must not call get_service_quota per quota"
+        # Second lookup must be served from cache (no new list_service_quotas call).
+        before = len(calls)
+        monitor._get_actual_quota_limit("connect", "L-D945C9A8", instance_id="inst-1")
+        assert len(calls) == before, "second lookup should hit the cached map"
 
     def test_no_context_required_quotas_remaining(self):
         """All quota definitions now omit resource-level context (design decision:
@@ -371,7 +367,6 @@ class TestServiceQuotasUsage:
         from lambda_function import ConnectQuotaMonitor
         m = ConnectQuotaMonitor.__new__(ConnectQuotaMonitor)
         m.region = "us-east-1"
-        m._get_account_id = lambda: "123456789012"
         return m
 
     def test_usage_queried_from_usage_metric(self):
@@ -379,13 +374,13 @@ class TestServiceQuotasUsage:
         captured = {}
 
         def fake_call(service, api, **kwargs):
-            if api == "get_service_quota":
-                return {"Quota": {"Value": 100.0, "UsageMetric": {
+            if api == "list_service_quotas":
+                return {"Quotas": [{"QuotaCode": "L-64992552", "Value": 100.0, "UsageMetric": {
                     "MetricNamespace": "AWS/Usage",
                     "MetricName": "ResourceCount",
                     "MetricDimensions": {"Service": "Connect", "Resource": "X"},
                     "MetricStatisticRecommendation": "Maximum",
-                }}}
+                }}]}
             captured.update(kwargs)  # the CloudWatch call
             return {"Datapoints": [{"Maximum": 42, "Timestamp": 0}]}
 
@@ -401,13 +396,69 @@ class TestServiceQuotasUsage:
         """No UsageMetric -> usage unknown (None), not a false 0."""
         monitor = self._make_monitor()
         monitor.call_service_api = lambda service, api, **k: (
-            {"Quota": {"Value": 50.0}} if api == "get_service_quota" else {}
+            {"Quotas": [{"QuotaCode": "L-59F577B1", "Value": 50.0}]}
+            if api == "list_service_quotas" else {}
         )
         usage, limit = monitor._monitor_via_service_quotas(
             "inst-1", {"service": "connect", "default_limit": 50}, "L-59F577B1"
         )
         assert usage is None, f"usage should be None (unknown), got {usage}"
         assert limit == 50
+
+    def test_synthetic_code_not_in_map_falls_back_to_default(self):
+        """A quota code that ListServiceQuotas does not return (e.g. a synthetic
+        L-API-* rate code) must fall back to the default with no per-quota call."""
+        monitor = self._make_monitor()
+        monitor.call_service_api = lambda service, api, **k: {"Quotas": []}
+        usage, limit = monitor._monitor_via_service_quotas(
+            "inst-1", {"service": "connect", "default_limit": 7}, "L-API-FAKE"
+        )
+        assert usage is None and limit == 7.0
+
+
+class TestApiRetryBackoff:
+    """Retry policy: deterministic errors must fail fast, throttling must back off."""
+
+    def _make_monitor(self):
+        from lambda_function import ConnectQuotaMonitor
+        m = ConnectQuotaMonitor.__new__(ConnectQuotaMonitor)
+        m.region = "us-east-1"
+        return m
+
+    def _client_raising(self, error_code):
+        from botocore.exceptions import ClientError
+
+        class _Client:
+            calls = 0
+
+            def list_service_quotas(self, **kwargs):
+                _Client.calls += 1
+                raise ClientError(
+                    {"Error": {"Code": error_code, "Message": "not available in Region"}},
+                    "ListServiceQuotas",
+                )
+
+        return _Client()
+
+    def test_no_such_resource_is_not_retried(self):
+        """NoSuchResourceException is deterministic -> one call, no backoff cycles."""
+        monitor = self._make_monitor()
+        client = self._client_raising("NoSuchResourceException")
+        monitor.get_service_client = lambda service: client
+        result = monitor.call_service_api("connect-participant", "list_service_quotas")
+        assert result is None
+        assert type(client).calls == 1, "must not retry a deterministic region error"
+
+    def test_throttling_is_retried(self, monkeypatch):
+        """TooManyRequestsException must exhaust the 3 retries (backoff path)."""
+        import lambda_function
+        monkeypatch.setattr(lambda_function.time, "sleep", lambda *_: None)
+        monitor = self._make_monitor()
+        client = self._client_raising("TooManyRequestsException")
+        monitor.get_service_client = lambda service: client
+        result = monitor.call_service_api("connect", "list_service_quotas")
+        assert result is None
+        assert type(client).calls == 3, "throttling should retry up to max_retries"
 
 
 class TestPaginationCounting:
@@ -508,12 +559,32 @@ class TestSnsPublish:
 class TestLiveRefreshTemplate:
     """Validate live-refresh SAM template."""
 
+    def _template(self):
+        template_path = Path(__file__).parent.parent / "live-refresh" / "template.yaml"
+        return template_path.read_text()
+
     def test_timeout_adequate(self):
         """Lambda timeout must be >= 120s for real-world scans."""
         import re
-        template_path = Path(__file__).parent.parent / "live-refresh" / "template.yaml"
-        content = template_path.read_text()
-        match = re.search(r"Timeout:\s*(\d+)", content)
+        match = re.search(r"Timeout:\s*(\d+)", self._template())
         assert match, "No Timeout found in template"
         timeout = int(match.group(1))
         assert timeout >= 120, f"Timeout {timeout}s is too low for production scans"
+
+    def test_api_path_matches_handler_contract(self):
+        """The API path must be /quota (what the handler and outputs use), not
+        the old /metrics that produced a 403 on the documented endpoint."""
+        content = self._template()
+        assert "Path: /quota" in content
+        assert "Path: /metrics" not in content
+
+    def test_no_unusable_api_key_requirement(self):
+        """ApiKeyRequired without an ApiKey/UsagePlan 403s every request with no
+        way to obtain a key; the endpoint must not re-introduce it."""
+        assert "ApiKeyRequired" not in self._template()
+
+    def test_api_is_throttled(self):
+        """Public read-only endpoint must be rate-limited to bound abuse/cost."""
+        content = self._template()
+        assert "ThrottlingRateLimit" in content
+        assert "ThrottlingBurstLimit" in content

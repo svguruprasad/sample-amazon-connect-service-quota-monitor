@@ -5,8 +5,8 @@
 Attach `cli-user-policy.json` to your IAM user or the role you assume.
 
 Before attaching, edit the file and replace:
-- `YOUR_ACCOUNT_ID` — your 12-digit AWS account ID
-- `YOUR_INSTANCE_ID` — your Connect instance ID
+- `YOUR_ACCOUNT_ID`: your 12-digit AWS account ID
+- `YOUR_INSTANCE_ID`: your Connect instance ID
 
 ```bash
 aws iam put-user-policy \
@@ -27,7 +27,7 @@ aws iam create-role \
 
 ### Step 2: Attach permissions
 
-Edit `lambda-permission-policy.json` first — replace `YOUR_BUCKET` and `YOUR_ACCOUNT_ID`.
+Edit `lambda-permission-policy.json` first: replace `YOUR_BUCKET` and `YOUR_ACCOUNT_ID`.
 
 ```bash
 aws iam put-role-policy \

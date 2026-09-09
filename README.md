@@ -105,11 +105,11 @@ These are `deploy.sh` flags, and the same names exist as CloudFormation paramete
 
 | Setting | Default | Meaning |
 |---------|---------|---------|
-| `--email` | required | Where breach alerts go |
+| `--email` | strongly recommended | Where breach alerts go (deploys without it, but you get no alerts) |
 | `--threshold` | `80` | Alert when a quota is at or above this percent |
 | `--schedule` | `rate(1 hour)` | How often the Lambda runs (a `rate()` or `cron()` expression) |
 | `UseS3Storage` | `true` | Keep JSON reports in S3 |
-| `UseDynamoDBStorage` | `false` | Also keep records in DynamoDB |
+| `UseDynamoDBStorage` | `true` | Also keep records in DynamoDB (set `false` to skip the table and its cost) |
 
 To change the threshold or schedule later, run `deploy.sh` again with the new values, or update the CloudFormation stack directly.
 
@@ -173,7 +173,7 @@ Rough monthly cost, which scales mostly with how many instances and quotas you h
 |-----------|----------|
 | Lambda (hourly) | $1 to $3 |
 | S3 (report history) | $0.10 to $0.50 |
-| DynamoDB (if enabled, on-demand) | $0.25 to $2.00 |
+| DynamoDB (on by default, on-demand) | $0.25 to $2.00 |
 | SNS (email) | about $0.10 |
 | CloudWatch (alarms and logs) | $0.50 to $1.00 |
 | Pilot total | about $3 |

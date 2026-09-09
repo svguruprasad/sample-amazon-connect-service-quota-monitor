@@ -12,6 +12,7 @@ Outputs:
     connect-resource-map.json         Full resource graph with relationships
     connect-quota-impact-model.json   Predictive model with migration formulas
     connect-dashboard.html            Self-contained interactive dashboard
+    connect-api-report.html           Consolidated per-API / per-flow report
 
 Required IAM Permissions (read-only):
     connect:ListContactFlows, connect:DescribeContactFlow,

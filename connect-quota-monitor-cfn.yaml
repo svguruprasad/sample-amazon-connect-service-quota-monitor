@@ -1,7 +1,15 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'Enhanced Amazon Connect Service Quota Monitor - Comprehensive monitoring of 70+ Connect quotas with intelligent deployment and consolidated alerting'
+Description: 'Enhanced Amazon Connect Service Quota Monitor - Comprehensive monitoring of 112 Connect quotas with intelligent deployment and consolidated alerting'
 
 Metadata:
+  # W1030: SubnetIds is referenced only inside the UseVPC branch of the Lambda
+  # VpcConfig !If, which resolves only when VpcId is non-empty (and then
+  # SubnetIds is required). cfn-lint cannot correlate the condition with the
+  # empty-list default, so it flags a case that can never reach VpcConfig.
+  cfn-lint:
+    config:
+      ignore_checks:
+        - W1030
   AWS::CloudFormation::Interface:
     ParameterGroups:
       - Label:
@@ -837,7 +845,7 @@ Resources:
 
 Outputs:
   LambdaFunction:
-    Description: "Enhanced Lambda function that monitors 70+ Connect quotas"
+    Description: "Enhanced Lambda function that monitors 112 Connect quotas"
     Value: !Ref QuotaMonitorLambda
     Export:
       Name: !Sub "${AWS::StackName}-LambdaFunction"
@@ -890,7 +898,7 @@ Outputs:
     
   MonitoringCapabilities:
     Description: "Enhanced monitoring capabilities"
-    Value: "70+ Connect quotas, Dynamic instance discovery, Consolidated alerting, Multi-service support, Flexible storage, Python 3.12 runtime"
+    Value: "112 Connect quotas, Dynamic instance discovery, Consolidated alerting, Multi-service support, Flexible storage, Python 3.12 runtime"
     
   DeploymentInstructions:
     Description: "Next steps for completing the deployment"
