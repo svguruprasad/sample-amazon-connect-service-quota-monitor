@@ -1,6 +1,6 @@
 # quota-monitor module
 
-Terraform port of `connect-quota-monitor-cfn.yaml` (no longer present in this repo). Deploys the enhanced
+Terraform port of `../../../connect-quota-monitor-cfn.yaml` (the CloudFormation template at the repo root). Deploys the enhanced
 Amazon Connect Service Quota Monitor: a scheduled Lambda function that
 discovers Connect instances, checks quota utilization against CloudWatch and
 Service Quotas, and sends consolidated alerts through SNS.
@@ -30,37 +30,31 @@ Service Quotas, and sends consolidated alerts through SNS.
   Quotas, CloudWatch, SNS, SQS, KMS, and (conditionally) S3/DynamoDB storage.
 - Optional security group and Lambda VPC config when `var.vpc_id` is set.
 
-## Parity notes (deliberate differences from the CFN template)
+## Parity notes (how this port relates to the CloudFormation template)
 
-1. **No placeholder+deploy.sh step.** The CFN template ships a bootstrap
-   `ZipFile` inline stub and relies on `deploy.sh` (no longer present in this
-   repo) to upload the real code to
-   S3 and call `UpdateFunctionCode` after stack create. Terraform's
-   `data.archive_file` bundles the real `lambda_function.py` and
-   `quota_definitions.json` directly into the deployment zip at plan time, so
-   a single `terraform apply` produces a fully working function. The CFN
-   template's deployment bucket and its `DEPLOYMENT_METHOD`/`DEPLOYMENT_BUCKET`
-   environment variables served that upload path and are not created by this
-   module.
-2. **DynamoDB table name and IAM scope now point at the table this module
-   actually creates.** The CFN template's `DynamoDBTableName` parameter
-   (default `ConnectQuotaMonitor`) is used for both the `DYNAMODB_TABLE`
-   environment variable and the `DynamoDBStoragePolicy` IAM resource ARN, but
-   the table CloudFormation actually creates is named
-   `${AWS::StackName}-metrics` (a different, unrelated name). Unless someone
-   manually renames the parameter to match, the deployed role can never
-   read/write the table the stack creates. This port ties `DYNAMODB_TABLE`
-   and the IAM policy to the real `aws_dynamodb_table.metrics` ARN and name so
-   DynamoDB storage works without extra configuration.
-3. **DynamoDB GSI has no provisioned throughput.** The CFN template sets
-   `BillingMode: PAY_PER_REQUEST` on the table but also sets
-   `ProvisionedThroughput` (5 read/5 write) on the `InstanceIdIndex` GSI. The
-   DynamoDB API rejects `ProvisionedThroughput` on any index when the table
-   billing mode is `PAY_PER_REQUEST`, so the CFN template as written would
-   fail at table-create time. This port omits read/write capacity on the GSI
-   so the table actually creates successfully.
-4. **Lambda runtime is python3.13**, matching the CFN template's runtime
-   parameter default.
+The CloudFormation template (`../../../connect-quota-monitor-cfn.yaml`) and this
+Terraform port deploy the same solution. Two bugs originally lived in the CFN
+template; both are now fixed in the CFN template as well, so the two paths are at
+parity. The notes below record the differences that remain by design.
+
+1. **Code packaging.** The CFN template ships a bootstrap `ZipFile` stub and
+   relies on `deploy.sh` (at the repo root) to package the real
+   `lambda_function.py` + `quota_definitions.json`, upload them to S3, and update
+   the function after stack create. Terraform's `data.archive_file` bundles the
+   real code into the deployment zip at plan time, so a single `terraform apply`
+   produces a working function with no separate upload step. Both paths run the
+   same Lambda source.
+2. **DynamoDB table name (fixed in both).** Originally the CFN template created
+   the table as `${AWS::StackName}-metrics` while the `DYNAMODB_TABLE` env var and
+   the IAM policy referenced the `DynamoDBTableName` parameter, so storage
+   targeted a table that did not exist. The CFN template now names the table
+   `!Ref DynamoDBTableName` so all three agree; this port ties the same three to
+   the real `aws_dynamodb_table.metrics`.
+3. **DynamoDB GSI throughput (fixed in both).** Originally the CFN template set
+   `ProvisionedThroughput` on the `InstanceIdIndex` GSI of a `PAY_PER_REQUEST`
+   table, which DynamoDB rejects at create time. Both the CFN template and this
+   port now omit provisioned throughput on the GSI.
+4. **Lambda runtime is python3.13** in both.
 
 ## Inputs
 

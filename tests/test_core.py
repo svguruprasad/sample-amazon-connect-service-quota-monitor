@@ -163,9 +163,14 @@ class TestNoHardcodedSecrets:
                 f"Possible AWS key in {py_file.name}"
 
     # UUIDs that are allowed to appear in committed source because they are
-    # obvious placeholders, not a real Connect instance. Anything else that is
-    # UUID-shaped in tracked source fails the scan below.
-    ALLOWED_UUIDS = {"00000000-0000-0000-0000-000000000001"}
+    # obvious placeholders or well-known public AWS constants, not a real
+    # Connect instance. Anything else UUID-shaped in tracked source fails below.
+    ALLOWED_UUIDS = {
+        "00000000-0000-0000-0000-000000000001",  # placeholder instance id
+        # AWS-managed CloudFront policy IDs referenced in cloudfront.tf (public):
+        "4135ea2d-6df8-44a3-9df3-4b5a84be39ad",  # Managed-CachingDisabled
+        "b689b0a8-53d0-40ab-baf2-68738e2966ac",  # Managed-AllViewerExceptHostHeader
+    }
 
     def test_no_hardcoded_instance_ids_in_source(self):
         """No real Connect instance ID (or any non-placeholder UUID) in committed

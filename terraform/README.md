@@ -1,11 +1,11 @@
 # Connect Quota Monitor, Terraform port
 
-This is the deployment method for the solution. It was originally ported from
-two IaC stacks that have since been removed from the repository (a
-CloudFormation template and a SAM template):
+This is one of the two deployment methods for the solution (the other is the
+CloudFormation/SAM path driven by `deploy.sh`; see the root README). It was
+ported from the two IaC stacks that still live at the repository root:
 
-- `modules/quota-monitor` (was ported from the former CloudFormation template)
-- `modules/live-refresh` (was ported from the former SAM template)
+- `modules/quota-monitor` (ported from [../connect-quota-monitor-cfn.yaml](../connect-quota-monitor-cfn.yaml))
+- `modules/live-refresh` (ported from [../live-refresh/template.yaml](../live-refresh/template.yaml))
 
 Each module's README has a "Parity notes" section recording the deliberate
 fixes and improvements made during that port.
@@ -329,6 +329,6 @@ terraform/
   outputs.tf                    surfaces module outputs
   terraform.tfvars.example      copy to terraform.tfvars and fill in
   modules/
-    quota-monitor/               port of connect-quota-monitor-cfn.yaml (no longer present in this repo)
-    live-refresh/                port of live-refresh/template.yaml (no longer present in this repo)
+    quota-monitor/               port of ../connect-quota-monitor-cfn.yaml
+    live-refresh/                port of ../live-refresh/template.yaml
 ```

@@ -6,12 +6,24 @@ Get an email before your Amazon Connect quotas run out, instead of finding out w
 
 Amazon Connect enforces service quotas on almost everything: phone numbers, contact flows, queues, concurrent calls, and the rate at which you can call its APIs. When you hit one, the failure usually shows up in production as a dropped call or a throttled API, and by then it is a customer-facing incident.
 
-This solution has two parts, deployed together by one Terraform apply:
+This solution has two parts:
 
 1. **Quota monitor.** A Lambda function runs on a schedule (hourly by default), discovers every Connect instance in your account and Region, measures how close each quota is to its limit, and emails you through SNS when something crosses a threshold you set. It reads usage from the Connect APIs, CloudWatch, and Service Quotas, and stores a JSON report of every run in S3 and (optionally) DynamoDB.
-2. **Live-refresh dashboard.** A second Lambda runs on its own schedule and regenerates a consolidated HTML dashboard of the same quota data. The dashboard is not public: it is served out of a private S3 bucket through CloudFront with Origin Access Control, and a Cognito login gate sits in front of both the dashboard and its `/quota` API. The `/quota` endpoint also answers history queries (`?history=1h`, `1d`, `7d`, `trend`) for the trend chart on the page, and is throttled at the API Gateway stage so a single bot cannot run up your CloudWatch bill.
+2. **Live-refresh dashboard.** A second Lambda runs on its own schedule and regenerates a consolidated HTML dashboard of the same quota data, plus a `/quota` API that answers history queries (`?history=1h`, `1d`, `7d`, `trend`) for the trend chart on the page.
 
-There is no code to write. You set a handful of Terraform variables and run `terraform apply`.
+You do not write any code; you set a few variables and deploy.
+
+## Two ways to deploy
+
+Pick one. Both deploy the same two Lambdas from the same `lambda_function.py`, so the monitoring behavior is identical. They differ in how the dashboard is exposed:
+
+| | Terraform | CloudFormation |
+|---|-----------|----------------|
+| Entry point | `terraform apply` in [terraform/](terraform/) | `./deploy.sh` with the root [connect-quota-monitor-cfn.yaml](connect-quota-monitor-cfn.yaml) (monitor) and [live-refresh/template.yaml](live-refresh/template.yaml) (dashboard, SAM) |
+| Dashboard exposure | Private S3 + CloudFront (Origin Access Control) with a **Cognito login gate** on the dashboard and its `/quota` API (Lambda@Edge) | API Gateway endpoint, **no built-in login gate** (the SAM template leaves auth to you: add an `AWS_IAM` or Cognito authorizer before exposing it) |
+| Best for | A polished, customer-facing dashboard that must not be reachable without a login | Teams already standardized on CloudFormation, or who only want the monitor + alerts and will gate or skip the dashboard themselves |
+
+If reaching the dashboard without a username and password would be a problem for you, use the Terraform path; its login gate is built in. The two deployment paths are independent; do not run both against the same account without changing names, or their resources will collide.
 
 ## Architecture
 
@@ -65,7 +77,7 @@ You need the Connect instance ID for `connect_instance_id` if you deploy the liv
 
 If `enable_auth = true` (the default), the stack includes a Lambda@Edge function, which AWS only lets you create in `us-east-1`. Keep `region` set to `us-east-1` if you use the login gate; the quota monitor itself still works against a Connect instance in any Region.
 
-## Deploy
+## Deploy with Terraform
 
 Full step-by-step instructions, including the two-phase apply required for the Cognito login gate, are in [terraform/README.md](terraform/README.md). The short version:
 
@@ -106,6 +118,34 @@ eval "$(terraform output -raw live_refresh_test_user_password_command)"
 Log in at the Cognito hosted-UI prompt (it appears when you open `live_refresh_dashboard_url`) using the `test_user_email` you set and the password from the command above.
 
 See [terraform/README.md](terraform/README.md) and [terraform/modules/live-refresh/README.md](terraform/modules/live-refresh/README.md) for the full detail on why the two phases are needed and what each one creates.
+
+## Deploy with CloudFormation
+
+The CloudFormation path uses `deploy.sh`, which packages the Lambda code (`lambda_function.py` + `quota_definitions.json`), uploads it to an S3 bucket it manages, and creates or updates the stack from [connect-quota-monitor-cfn.yaml](connect-quota-monitor-cfn.yaml). It needs the AWS CLI v2 and a bash shell.
+
+```bash
+git clone https://github.com/aws-samples/sample-amazon-connect-service-quota-monitor.git
+cd sample-amazon-connect-service-quota-monitor
+
+# Deploy the monitor + alerts. --email subscribes an address to the alert topic.
+./deploy.sh --email you@example.com --threshold 80
+
+# Options: --stack-name NAME, --threshold 1-99, --runtime, --memory,
+#          --vpc-id vpc-xxxx --subnet-ids subnet-a,subnet-b. Run ./deploy.sh --help.
+```
+
+Confirm the SNS subscription email when it arrives, or alerts will not deliver.
+
+The dashboard is a separate SAM stack ([live-refresh/template.yaml](live-refresh/template.yaml)) deployed with the AWS SAM CLI:
+
+```bash
+cd live-refresh
+sam build && sam deploy --guided   # answer the prompts; re-run without --guided after the first time
+```
+
+Important: the SAM dashboard stack exposes its `/quota` API through API Gateway with **no login gate**. If anyone with the URL should not be able to read your quota data, add an `AWS_IAM` or Cognito authorizer to `DashboardApi` in the template before you deploy it, or use the Terraform path, whose Cognito login gate is built in. This is the one real difference between the two deployment methods.
+
+Tear the CloudFormation deployment down with `aws cloudformation delete-stack --stack-name <name>` (and `sam delete` for the dashboard stack). Empty the S3 buckets first if you want them removed.
 
 ## Where the reports and dashboard live
 
@@ -193,6 +233,9 @@ KMS is the one line item that does not scale down with traffic. Set `use_dynamod
 | Topic | Link |
 |-------|------|
 | Terraform deploy, all variables, teardown, two-phase auth apply | [terraform/README.md](terraform/README.md) |
+| CloudFormation monitor template | [connect-quota-monitor-cfn.yaml](connect-quota-monitor-cfn.yaml) |
+| CloudFormation deploy script (`--help` for options) | [deploy.sh](deploy.sh) |
+| SAM dashboard template (no built-in login gate) | [live-refresh/template.yaml](live-refresh/template.yaml) |
 | quota-monitor module detail | [terraform/modules/quota-monitor/README.md](terraform/modules/quota-monitor/README.md) |
 | live-refresh module detail, login gate internals | [terraform/modules/live-refresh/README.md](terraform/modules/live-refresh/README.md) |
 | Operations guide (schedule, history queries, logs) | [docs/operations-guide.md](docs/operations-guide.md) |

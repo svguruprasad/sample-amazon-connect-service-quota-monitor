@@ -1,7 +1,7 @@
 # live-refresh module
 
-Terraform port of `live-refresh/template.yaml` (AWS SAM, no longer present in
-this repo). Deploys a Lambda
+Terraform port of `../../../live-refresh/template.yaml` (the AWS SAM template at
+the repo root). Deploys a Lambda
 function behind an API Gateway REST API that serves real-time CloudWatch and
 Service Quotas metrics to the Connect Operations Dashboard, plus a scheduled
 run that writes a snapshot and regenerates the dashboard page.

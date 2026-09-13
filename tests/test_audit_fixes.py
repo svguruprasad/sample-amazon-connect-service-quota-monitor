@@ -47,18 +47,18 @@ class TestPhoneNumbersV2Params:
         m.region = "us-east-1"
         m._get_account_id = lambda: "123456789012"
         return m._build_api_parameters(
-            "6c3f17c0-0000-0000-0000-000000000000",
+            "00000000-0000-0000-0000-000000000001",
             {"service": "connect", "api": api, "scope": "INSTANCE"},
         )
 
     def test_phone_numbers_v2_uses_target_arn_only(self):
         params = self._params("list_phone_numbers_v2")
         assert "InstanceId" not in params, "must not send InstanceId alongside TargetArn"
-        assert params["TargetArn"].endswith(":instance/6c3f17c0-0000-0000-0000-000000000000")
+        assert params["TargetArn"].endswith(":instance/00000000-0000-0000-0000-000000000001")
 
     def test_other_connect_api_still_gets_instance_id(self):
         params = self._params("list_queues")
-        assert params["InstanceId"] == "6c3f17c0-0000-0000-0000-000000000000"
+        assert params["InstanceId"] == "00000000-0000-0000-0000-000000000001"
 
 
 # ---------------------------------------------------------------------------
