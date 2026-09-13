@@ -481,6 +481,18 @@ def collect_lambda_functions(
         try:
             func = lambda_client.get_function(FunctionName=arn)
             config = func.get("Configuration", {})
+            # Strip sensitive fields at the point of collection so they never
+            # enter the resource map (which can be rendered into the dashboard
+            # HTML). Environment.Variables in particular can hold plaintext
+            # secrets; Role/VpcConfig/KMSKeyArn are internal wiring the report
+            # never shows. This keeps the display fields (name, runtime, memory,
+            # timeout, ARN, provisioned concurrency) while removing the rest.
+            for sensitive in (
+                "Environment", "Role", "VpcConfig", "KMSKeyArn",
+                "DeadLetterConfig", "FileSystemConfigs", "ImageConfigResponse",
+                "Layers", "SnapStart",
+            ):
+                config.pop(sensitive, None)
             config["ProvisionedConcurrency"] = _get_provisioned_concurrency(
                 lambda_client, config.get("FunctionName", "")
             )
@@ -554,7 +566,7 @@ def collect_lex_bots(
         )
 
     try:
-        response = lex_client.list_bots(MaxResults=50)
+        response = lex_client.list_bots(maxResults=50)
         bots = response.get("botSummaries", [])
         logger.info("Found %d Lex bots (account-level).", len(bots))
         return bots

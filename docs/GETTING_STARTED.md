@@ -1,6 +1,8 @@
-# Getting Started: Full Setup Guide
+# Local report generation (CLI only, no deployment)
 
-This guide walks you through every step from zero to a working dashboard. Follow it exactly. If something looks different from what's described, check the Common Issues section in the README.
+This is an optional local tool. It is not the way to deploy the Connect Quota Monitor solution. For deployment, see the root [README.md](../README.md) and [terraform/README.md](../terraform/README.md), which set up the scheduled Lambda functions, the alerting, and the live-refresh dashboard through Terraform.
+
+This guide walks you through running `connect-resource-mapper.py` on your own machine to produce a one-off, static HTML report and dashboard from your Connect instance's current configuration. There is no deployment, no schedule, and no login: the output is a set of local files you open in a browser once. Follow it exactly. If something looks different from what's described, check the Common Issues section in the README.
 
 ---
 

@@ -7,7 +7,7 @@
       "Action": [
         "connect:List*",
         "connect:Describe*",
-        "connect:Get*",
+        "connect:GetTrafficDistribution",
         "servicequotas:ListServiceQuotas",
         "cloudwatch:GetMetricData",
         "cloudwatch:GetMetricStatistics"

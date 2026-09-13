@@ -148,39 +148,6 @@ class TestQuotaReportHtmlXss:
         assert "<script>alert(2)</script>" not in html
 
 
-class TestCFNTemplate:
-    """Validate CloudFormation template structure."""
-
-    def test_template_has_required_sections(self):
-        """CFN template has AWSTemplateFormatVersion, Resources, Outputs."""
-        template_path = Path(__file__).parent.parent / "connect-quota-monitor-cfn.yaml"
-        content = template_path.read_text()
-        assert "AWSTemplateFormatVersion" in content
-        assert "Resources:" in content
-        assert "Outputs:" in content
-
-    def test_no_duplicate_output_keys(self):
-        """Regression: C1 — duplicate outputs cause deploy failure."""
-        import re
-        template_path = Path(__file__).parent.parent / "connect-quota-monitor-cfn.yaml"
-        content = template_path.read_text()
-        output_section = content.split("Outputs:")[1] if "Outputs:" in content else ""
-        keys = re.findall(r"^  (\w+):", output_section, re.MULTILINE)
-        duplicates = [k for k in set(keys) if keys.count(k) > 1]
-        assert duplicates == [], f"Duplicate CFN Output keys: {duplicates}"
-
-    def test_no_hardcoded_account_ids_in_template(self):
-        """Regression: C2 — no real account IDs in template."""
-        import re
-        template_path = Path(__file__).parent.parent / "connect-quota-monitor-cfn.yaml"
-        content = template_path.read_text()
-        # Any 12-digit sequence that is not a well-known documentation placeholder
-        # is treated as a possible real account ID.
-        placeholders = {"000000000000", "123456789012"}
-        real_ids = [m for m in re.findall(r"\b\d{12}\b", content) if m not in placeholders]
-        assert real_ids == [], f"Possible hardcoded account IDs: {real_ids}"
-
-
 class TestNoHardcodedSecrets:
     """Security: no credentials in source."""
 
@@ -195,21 +162,44 @@ class TestNoHardcodedSecrets:
             assert not re.search(r"AKIA[A-Z0-9]{16}", content), \
                 f"Possible AWS key in {py_file.name}"
 
+    # UUIDs that are allowed to appear in committed source because they are
+    # obvious placeholders, not a real Connect instance. Anything else that is
+    # UUID-shaped in tracked source fails the scan below.
+    ALLOWED_UUIDS = {"00000000-0000-0000-0000-000000000001"}
+
     def test_no_hardcoded_instance_ids_in_source(self):
-        """No real Connect instance ID in committed source. The specific value to
-        scan for is supplied via the FORBIDDEN_INSTANCE_ID env var (never
-        committed), so this test file does not itself embed the identifier it
-        guards against. Set it locally or in CI to scan a known dev instance."""
-        import os
-        forbidden = os.environ.get("FORBIDDEN_INSTANCE_ID", "").strip()
-        if not forbidden:
-            import pytest
-            pytest.skip("Set FORBIDDEN_INSTANCE_ID to scan source for a specific instance ID")
+        """No real Connect instance ID (or any non-placeholder UUID) in committed
+        source. Connect instance IDs are UUIDs, so a real one leaking into the repo
+        would be UUID-shaped. This scans every git-tracked source file and allows
+        only the known placeholder UUIDs; a real deployment's instance ID lives in
+        the gitignored terraform.tfvars and must never reach a tracked file. Runs
+        unconditionally so CI always enforces it (no env var, no skip)."""
+        import re
+        import subprocess
+
         root = Path(__file__).parent.parent
-        for py_file in root.rglob("*.py"):
-            if ".git" in str(py_file) or "__pycache__" in str(py_file) or "output" in str(py_file):
+        uuid_re = re.compile(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE
+        )
+        scanned_exts = (".py", ".tf", ".tftpl", ".js", ".json", ".md", ".yaml", ".yml", ".sh")
+        allowed = {u.lower() for u in self.ALLOWED_UUIDS}
+
+        # git ls-files gives exactly the committed files, so gitignored secrets
+        # (terraform.tfvars, terraform.tfstate) are never scanned or flagged.
+        tracked = subprocess.run(
+            ["git", "ls-files"], cwd=root, capture_output=True, text=True, check=True
+        ).stdout.split()
+
+        offenders = {}
+        for rel in tracked:
+            if not rel.endswith(scanned_exts):
                 continue
-            assert forbidden not in py_file.read_text(), f"Hardcoded instance ID in {py_file.name}"
+            text = (root / rel).read_text(encoding="utf-8", errors="ignore")
+            found = {m.lower() for m in uuid_re.findall(text)} - allowed
+            if found:
+                offenders[rel] = sorted(found)
+
+        assert not offenders, f"Non-placeholder UUID(s) in committed source: {offenders}"
 
 
 class TestCloudWatchMonitoring:
@@ -463,8 +453,10 @@ class TestApiRetryBackoff:
 
 
 class TestServiceQuotaMapCaching:
-    """Regression: a failed/partial ListServiceQuotas page must not be cached,
-    or real applied limits are shadowed by defaults for the whole 5-min TTL."""
+    """Regression: a partial/failed ListServiceQuotas result is reused within one
+    invocation (so a throttle can't cause a re-fetch storm that blows the 300s
+    budget) but is NOT promoted to the cross-invocation cache (so it can't shadow
+    real applied limits with defaults across runs and hide a breach)."""
 
     def _make_monitor(self):
         from lambda_function import ConnectQuotaMonitor
@@ -472,14 +464,16 @@ class TestServiceQuotaMapCaching:
         m.region = "us-east-1"
         return m
 
-    def test_partial_pagination_not_cached(self):
+    def test_partial_result_memoized_within_invocation(self):
+        """A throttled/partial fetch must be attempted at most once per service
+        per invocation (no re-fetch storm)."""
         monitor = self._make_monitor()
         calls = {"n": 0}
 
         def fake_call(service, api, **kwargs):
             calls["n"] += 1
             if "NextToken" in kwargs:
-                return None  # page 2 fails / throttles out
+                return None  # page 2 throttles out -> incomplete map
             return {"Quotas": [{"QuotaCode": "L-1", "Value": 5.0}], "NextToken": "tok"}
 
         monitor.call_service_api = fake_call
@@ -487,7 +481,19 @@ class TestServiceQuotaMapCaching:
         assert "L-1" in first, "partial data is still returned for this call"
         n_after_first = calls["n"]
         monitor._get_service_quota_map("connect")
-        assert calls["n"] > n_after_first, "a partial/failed map must not be cached"
+        assert calls["n"] == n_after_first, "a second lookup this invocation must be memoized, not re-fetched"
+
+    def test_partial_not_promoted_to_cross_invocation_cache(self):
+        """A partial map must not land in the 5-min cross-call cache, so a fresh
+        instance (next invocation) retries instead of serving stale defaults."""
+        monitor = self._make_monitor()
+        monitor.call_service_api = lambda service, api, **k: (
+            {"Quotas": [{"QuotaCode": "L-1", "Value": 5.0}], "NextToken": "tok"}
+            if "NextToken" not in k else None
+        )
+        monitor._get_service_quota_map("connect")
+        assert "connect" not in getattr(monitor, "_service_quota_maps", {}), \
+            "partial map must not be promoted to the cross-invocation cache"
 
     def test_complete_map_is_cached(self):
         monitor = self._make_monitor()
@@ -502,6 +508,7 @@ class TestServiceQuotaMapCaching:
         n = calls["n"]
         monitor._get_service_quota_map("connect")
         assert calls["n"] == n, "a complete map should be cached (no re-fetch within TTL)"
+        assert "connect" in monitor._service_quota_maps, "complete map should be in the cross-call cache"
 
 
 class TestApiCountDispatch:
@@ -679,37 +686,3 @@ class TestSnsPublish:
         assert set(body.keys()) == {"default", "email", "sms"}, body.keys()
         assert "json" not in body
         assert len(captured["Subject"]) <= 100
-
-
-class TestLiveRefreshTemplate:
-    """Validate live-refresh SAM template."""
-
-    def _template(self):
-        template_path = Path(__file__).parent.parent / "live-refresh" / "template.yaml"
-        return template_path.read_text()
-
-    def test_timeout_adequate(self):
-        """Lambda timeout must be >= 120s for real-world scans."""
-        import re
-        match = re.search(r"Timeout:\s*(\d+)", self._template())
-        assert match, "No Timeout found in template"
-        timeout = int(match.group(1))
-        assert timeout >= 120, f"Timeout {timeout}s is too low for production scans"
-
-    def test_api_path_matches_handler_contract(self):
-        """The API path must be /quota (what the handler and outputs use), not
-        the old /metrics that produced a 403 on the documented endpoint."""
-        content = self._template()
-        assert "Path: /quota" in content
-        assert "Path: /metrics" not in content
-
-    def test_no_unusable_api_key_requirement(self):
-        """ApiKeyRequired without an ApiKey/UsagePlan 403s every request with no
-        way to obtain a key; the endpoint must not re-introduce it."""
-        assert "ApiKeyRequired" not in self._template()
-
-    def test_api_is_throttled(self):
-        """Public read-only endpoint must be rate-limited to bound abuse/cost."""
-        content = self._template()
-        assert "ThrottlingRateLimit" in content
-        assert "ThrottlingBurstLimit" in content

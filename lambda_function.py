@@ -28,7 +28,7 @@ Architecture:
 - Enhanced security compliance with data sanitization
 
 Usage:
-This function is designed to be deployed via CloudFormation and triggered by CloudWatch Events.
+This function is designed to be deployed via Terraform and triggered by Amazon EventBridge.
 It automatically discovers Connect instances and monitors all configured quotas.
 """
 
@@ -40,6 +40,7 @@ import os
 import sys
 import re
 import time
+import random
 from botocore.exceptions import ClientError, BotoCoreError
 from botocore.config import Config
 import uuid
@@ -557,8 +558,10 @@ class ConnectQuotaMonitor:
                 # rate-limited; without it here the backoff never triggers for the
                 # one API most likely to throttle this workload.
                 if error_code in ['Throttling', 'ThrottlingException', 'RequestLimitExceeded', 'TooManyRequestsException']:
-                    # Exponential backoff for throttling
-                    wait_time = (2 ** retry_count) + (retry_count * 0.1)
+                    # Exponential backoff with full jitter so concurrent invocations
+                    # (and this invocation's own retries) don't hit the shared
+                    # Service Quotas rate bucket in lockstep.
+                    wait_time = (2 ** retry_count) + random.uniform(0, 1)
                     logger.warning(f"API throttled for {service_name}.{api_method}, retrying in {wait_time}s")
                     time.sleep(wait_time)
                     retry_count += 1
@@ -844,22 +847,52 @@ class ConnectQuotaMonitor:
         instances = self.get_connect_instances()
         return [instance for instance in instances if instance.get('IsActive', False)]
     
-    def validate_instance_permissions(self, instance_id):
-        """Validate that we have necessary permissions for an instance."""
+    def check_instance_access(self, instance_id):
+        """Probe access to an instance, distinguishing a real permission gap
+        from a transient failure.
+
+        Returns one of:
+          'ok'      - list_users succeeded; we can monitor this instance.
+          'denied'  - AccessDenied/Unauthorized; monitoring will not work, skip.
+          'unknown' - throttling, a network error, or any other transient/
+                      indeterminate failure. The caller should NOT skip the
+                      instance on this: a throttle is not a permission gap, and
+                      skipping would silently drop a breaching instance from the
+                      run. Per-quota calls will report None where they truly
+                      cannot read, without discarding the whole instance.
+
+        This calls the client directly (not call_service_api, which collapses
+        every failure to None) so it can inspect the error code.
+        """
         try:
-            # Test basic permissions by trying to list users
-            response = self.call_service_api('connect', 'list_users', InstanceId=instance_id, MaxResults=1)
-            
-            if response is not None:
-                logger.debug(f"Permissions validated for instance {instance_id}")
-                return True
-            else:
-                logger.warning(f"Permission validation failed for instance {instance_id}")
-                return False
-                
+            client = self.get_service_client('connect')
+            if not client:
+                return 'unknown'
+            client.list_users(InstanceId=instance_id, MaxResults=1)
+            logger.debug(f"Access validated for instance {instance_id}")
+            return 'ok'
+        except ClientError as e:
+            code = e.response.get('Error', {}).get('Code', '')
+            if code in ('AccessDenied', 'AccessDeniedException', 'UnauthorizedOperation', 'Forbidden'):
+                logger.warning(f"Access denied for instance {instance_id}: {code}")
+                return 'denied'
+            logger.warning(
+                f"Access probe for instance {instance_id} was indeterminate ({code}); "
+                f"proceeding to monitor rather than skipping"
+            )
+            return 'unknown'
         except Exception as e:
-            logger.warning(f"Permission validation error for instance {instance_id}: {sanitize_log(str(e))}")
-            return False
+            logger.warning(
+                f"Access probe error for instance {instance_id}: {sanitize_log(str(e))}; "
+                f"proceeding to monitor rather than skipping"
+            )
+            return 'unknown'
+
+    def validate_instance_permissions(self, instance_id):
+        """Backward-compatible boolean probe: True only when access is confirmed.
+        Prefer check_instance_access() when you need to tell 'denied' apart from
+        a transient 'unknown'."""
+        return self.check_instance_access(instance_id) == 'ok'
     
     def validate_no_hardcoded_references(self):
         """
@@ -1012,12 +1045,22 @@ class ConnectQuotaMonitor:
             
             logger.info(f"Monitoring instance: {instance_alias} ({instance_id})")
             
-            # Validate permissions for this instance
-            if not self.validate_instance_permissions(instance_id):
+            # Validate permissions for this instance. Only skip on a definite
+            # access denial -- a transient throttle/network blip returns
+            # 'unknown', and skipping on that would silently drop a possibly
+            # breaching instance from the run (a false negative on the exact
+            # thing this tool exists to catch).
+            access = self.check_instance_access(instance_id)
+            if access == 'denied':
                 error_msg = f"Insufficient permissions for instance {instance_id}"
                 logger.error(error_msg)
                 monitoring_results['errors'].append(error_msg)
                 continue
+            elif access == 'unknown':
+                logger.warning(
+                    f"Access probe for instance {instance_id} was indeterminate; "
+                    f"monitoring anyway, individual quotas will report unavailable if unreadable"
+                )
             
             instance_results = []
             instance_violations = 0
@@ -1090,17 +1133,23 @@ class ConnectQuotaMonitor:
                 'alert_results': {'error': 'Failed to create alert engine'}
             }
         
-        # Validate SNS configuration
+        # Validate SNS configuration. A topic whose only subscriptions are
+        # unconfirmed is reported invalid here (alerts would be silently
+        # dropped); surface it as a prominent warning in the results rather
+        # than failing the whole run, so the monitoring data is still produced.
         is_valid, validation_message = alert_engine.validate_sns_configuration()
         if not is_valid:
-            logger.error(f"SNS configuration invalid: {validation_message}")
+            logger.error(f"SNS configuration problem: {validation_message}")
             return {
                 **monitoring_results,
-                'alert_results': {'error': f'SNS configuration invalid: {validation_message}'}
+                'alert_results': {
+                    'error': f'SNS configuration invalid: {validation_message}',
+                    'sns_warning': validation_message,
+                }
             }
-        
+
         logger.info(f"SNS configuration: {validation_message}")
-        
+
         # Process alerts if violations found
         if monitoring_results.get('violations_found', 0) > 0:
             logger.info(f"Processing {monitoring_results['violations_found']} violations for consolidated alerts")
@@ -1114,6 +1163,14 @@ class ConnectQuotaMonitor:
                 'account_violations': 0,
                 'errors': []
             }
+            # Opt-in positive signal so a healthy run is not indistinguishable
+            # from a broken/unsubscribed monitor.
+            if os.environ.get('SEND_ALLCLEAR_HEARTBEAT', 'false').lower() == 'true':
+                alert_engine.send_heartbeat(
+                    f"Connect Quota Monitor ran and found no threshold breaches. "
+                    f"Instances monitored: {monitoring_results.get('instances_monitored', 0)}, "
+                    f"quotas checked: {monitoring_results.get('total_quotas_checked', 0)}."
+                )
         
         # Combine results
         final_results = {
@@ -1498,6 +1555,18 @@ class ConnectQuotaMonitor:
         # Calculate utilization percentage
         if quota_limit > 0:
             utilization_percentage = (current_usage / quota_limit) * 100
+        elif current_usage > 0:
+            # We have real usage but no usable limit (limit is 0/unknown -- e.g.
+            # a quota not registered with Service Quotas, or an AccessDenied on
+            # the applied-limit lookup). Forcing 0% here would report a resource
+            # that is actively in use as "healthy", masking a possible breach.
+            # Report it as unavailable instead, consistent with how pagination
+            # and multi-count paths return None rather than a false-low value.
+            logger.warning(
+                f"Quota {quota_name} has usage {current_usage} but no usable limit "
+                f"({quota_limit}); reporting utilization as unavailable rather than 0%"
+            )
+            return None
         else:
             utilization_percentage = 0
         
@@ -1827,9 +1896,20 @@ class ConnectQuotaMonitor:
         """
         if not hasattr(self, '_service_quota_maps'):
             self._service_quota_maps = {}
+        if not hasattr(self, '_service_quota_attempts'):
+            self._service_quota_attempts = {}
         cached = self._service_quota_maps.get(service_code)
         if cached and (datetime.now(timezone.utc) - cached[1]).total_seconds() < 300:
             return cached[0]
+        # Attempt the fetch at most once per service per invocation. Without this,
+        # a single throttled ListServiceQuotas (which returns an incomplete map we
+        # deliberately do not cache) makes every one of ~100 quota lookups re-issue
+        # the throttled call, each burning a full retry/backoff cycle -> a re-fetch
+        # storm that blows the Lambda's 300s budget. Reusing the partial result
+        # within the run keeps the single-invocation cost bounded (~one attempt per
+        # distinct service) without promoting a partial map to the cross-call cache.
+        if service_code in self._service_quota_attempts:
+            return self._service_quota_attempts[service_code]
 
         quotas = {}
         complete = False
@@ -1837,7 +1917,7 @@ class ConnectQuotaMonitor:
             next_token = None
             pages = 0
             while pages < 50:
-                params = {'ServiceCode': service_code}
+                params = {'ServiceCode': service_code, 'MaxResults': 100}
                 if next_token:
                     params['NextToken'] = next_token
                 resp = self.call_service_api('service-quotas', 'list_service_quotas', **params)
@@ -1861,9 +1941,16 @@ class ConnectQuotaMonitor:
             # call) yields no map; callers fall back to the documented default.
             logger.warning(f"Could not list service quotas for '{service_code}': {sanitize_log(str(e))}")
 
+        # Record the attempt so the rest of this invocation reuses this result
+        # instead of re-calling a throttled endpoint (bounds calls to one per
+        # service per run). This store is invocation-scoped, not the cross-call
+        # 5-minute cache, so a partial map is never promoted across invocations.
+        self._service_quota_attempts[service_code] = quotas
+
         if complete:
-            # Only cache a fully-paginated result. An incomplete map is returned
-            # for this call but not cached, so the next call retries rather than
+            # Only cache a fully-paginated result in the cross-call TTL cache. An
+            # incomplete map is reused within this invocation (above) but not
+            # cached across invocations, so the next run retries rather than
             # serving defaults for the whole TTL window.
             self._service_quota_maps[service_code] = (quotas, datetime.now(timezone.utc))
             logger.info(f"Loaded {len(quotas)} applied quotas for service '{service_code}'")
@@ -1948,21 +2035,24 @@ class ConnectQuotaMonitor:
         
         params = {}
         
-        # Add instance ID for instance-scoped quotas
+        # Add instance ID for instance-scoped quotas.
+        # list_phone_numbers_v2 is the exception: it takes InstanceId OR
+        # TargetArn, never both (AWS rejects the pair with a validation error),
+        # so it is handled below via TargetArn and must NOT also get InstanceId.
         if scope == 'INSTANCE' and instance_id:
-            if service == 'connect':
+            if service == 'connect' and api_name != 'list_phone_numbers_v2':
                 params['InstanceId'] = instance_id
             elif service == 'connectcases':
                 params['instanceId'] = instance_id
             elif service == 'connectcampaigns':
                 params['instanceId'] = instance_id
-        
+
         # Add service-specific parameters
         if service == 'connect' and api_name == 'list_queues':
             params['QueueTypes'] = ['STANDARD']
         elif service == 'connect' and api_name == 'list_phone_numbers_v2':
             params['TargetArn'] = f"arn:aws:connect:{self.region}:{self._get_account_id()}:instance/{instance_id}"
-        
+
         return params
     
     def _get_response_key(self, service, api_name):
@@ -2384,11 +2474,19 @@ class FlexibleStorageEngine:
         """Prepare consolidated monitoring report for storage."""
         timestamp = datetime.now(timezone.utc)
         
+        # Record the threshold this run actually used so downstream renderers
+        # (quota_report_to_html.py) flag violations against the real configured
+        # value instead of a hardcoded default that can disagree with the KPIs.
+        effective_threshold = _coerce_threshold(
+            os.environ.get('THRESHOLD_PERCENTAGE', THRESHOLD_PERCENTAGE)
+        )
+
         return {
             'record_type': 'consolidated_report',
             'timestamp': timestamp.isoformat(),
             'date': timestamp.strftime('%Y-%m-%d'),
             'execution_id': str(uuid.uuid4()),
+            'threshold_percentage': effective_threshold,
             'monitoring_results': monitoring_results,
             'alert_results': alert_results or {},
             'summary': {
@@ -2539,6 +2637,27 @@ class FlexibleStorageEngine:
             logger.error(f"S3 report storage error: {sanitize_log(str(e))}")
             return False
     
+    def _ttl_epoch(self):
+        """Epoch-seconds value for the DynamoDB `ttl` attribute so stored records
+        auto-expire. The table has TimeToLive enabled on `ttl`; without writing
+        this attribute, items never expire and the table grows without bound.
+        Retention is DYNAMODB_TTL_DAYS (default 90); set it to 0 to disable
+        expiry (returns None, and callers omit the attribute)."""
+        try:
+            days = int(os.environ.get('DYNAMODB_TTL_DAYS', '90'))
+        except (TypeError, ValueError):
+            days = 90
+        if days <= 0:
+            return None
+        return str(int(datetime.now(timezone.utc).timestamp()) + days * 86400)
+
+    def _apply_ttl(self, item):
+        """Add the `ttl` attribute to a DynamoDB item unless expiry is disabled."""
+        ttl = self._ttl_epoch()
+        if ttl is not None:
+            item['ttl'] = {'N': ttl}
+        return item
+
     def _store_to_dynamodb_instance(self, data):
         """Store instance metrics to DynamoDB."""
         try:
@@ -2570,12 +2689,12 @@ class FlexibleStorageEngine:
                 item['max_utilization'] = {'N': str(summary.get('max_utilization', 0))}
                 item['avg_utilization'] = {'N': str(summary.get('avg_utilization', 0))}
             
-            # Store item
+            # Store item (with TTL so it auto-expires per DYNAMODB_TTL_DAYS)
             self.dynamodb_client.put_item(
                 TableName=self.dynamodb_table,
-                Item=item
+                Item=self._apply_ttl(item)
             )
-            
+
             logger.info(f"Stored instance metrics to DynamoDB: {record_id}")
             return True
             
@@ -2612,12 +2731,12 @@ class FlexibleStorageEngine:
                 item['max_utilization'] = {'N': str(summary.get('max_utilization', 0))}
                 item['avg_utilization'] = {'N': str(summary.get('avg_utilization', 0))}
             
-            # Store item
+            # Store item (with TTL so it auto-expires per DYNAMODB_TTL_DAYS)
             self.dynamodb_client.put_item(
                 TableName=self.dynamodb_table,
-                Item=item
+                Item=self._apply_ttl(item)
             )
-            
+
             logger.info(f"Stored account metrics to DynamoDB: {record_id}")
             return True
             
@@ -2649,12 +2768,12 @@ class FlexibleStorageEngine:
                 item['alerts_sent'] = {'N': str(summary.get('alerts_sent', 0))}
                 item['errors_count'] = {'N': str(summary.get('errors_count', 0))}
             
-            # Store item
+            # Store item (with TTL so it auto-expires per DYNAMODB_TTL_DAYS)
             self.dynamodb_client.put_item(
                 TableName=self.dynamodb_table,
-                Item=item
+                Item=self._apply_ttl(item)
             )
-            
+
             logger.info(f"Stored consolidated report to DynamoDB: {record_id}")
             return True
             
@@ -3106,7 +3225,28 @@ class AlertConsolidationEngine:
         except Exception as e:
             logger.error(f"Unexpected error sending SNS alert: {sanitize_log(str(e))}")
             return False
-    
+
+    def send_heartbeat(self, summary_text):
+        """Publish an 'all clear' heartbeat so operators get a positive signal
+        that the monitor ran and the alerting path works, instead of silence
+        that is indistinguishable from a broken deployment or an unconfirmed
+        subscription. Opt-in via SEND_ALLCLEAR_HEARTBEAT=true. Best-effort:
+        a heartbeat failure never fails the run."""
+        try:
+            if not self.topic_arn or not self.topic_arn.startswith('arn:aws:sns:'):
+                return False
+            self.sns_client.publish(
+                TopicArn=self.topic_arn,
+                Subject='Connect Quota Monitor: all clear'[:100],
+                Message=summary_text,
+            )
+            logger.info("All-clear heartbeat published")
+            return True
+        except Exception as e:
+            logger.warning(f"Heartbeat publish failed (non-fatal): {sanitize_log(str(e))}")
+            return False
+
+
     def validate_sns_configuration(self):
         """Validate SNS topic configuration."""
         try:
@@ -3119,14 +3259,33 @@ class AlertConsolidationEngine:
             # Test topic accessibility
             self.sns_client.get_topic_attributes(TopicArn=self.topic_arn)
             
-            # Check if topic has subscriptions
+            # Check if topic has subscriptions, and how many are actually
+            # confirmed. A subscription that has not been confirmed has the
+            # literal SubscriptionArn "PendingConfirmation" and will NOT receive
+            # any published message -- so a topic with only pending subscriptions
+            # looks configured but silently drops every alert. Surface that.
             subscriptions = self.sns_client.list_subscriptions_by_topic(TopicArn=self.topic_arn)
-            subscription_count = len(subscriptions.get('Subscriptions', []))
-            
+            subs = subscriptions.get('Subscriptions', [])
+            subscription_count = len(subs)
+            pending = [s for s in subs if s.get('SubscriptionArn') == 'PendingConfirmation']
+            confirmed_count = subscription_count - len(pending)
+
             if subscription_count == 0:
                 return True, "SNS topic is valid but has no subscriptions"
-            
-            return True, f"SNS topic is valid with {subscription_count} subscription(s)"
+
+            if confirmed_count == 0:
+                # Valid topic, but every subscription is unconfirmed: alerts will
+                # not be delivered. Report invalid so the caller warns loudly.
+                return False, (
+                    f"SNS topic has {len(pending)} subscription(s) but none are "
+                    f"confirmed; alerts will not be delivered until the email "
+                    f"subscription is confirmed"
+                )
+
+            msg = f"SNS topic is valid with {confirmed_count} confirmed subscription(s)"
+            if pending:
+                msg += f" ({len(pending)} still pending confirmation)"
+            return True, msg
             
         except ClientError as e:
             error_code = e.response['Error']['Code']

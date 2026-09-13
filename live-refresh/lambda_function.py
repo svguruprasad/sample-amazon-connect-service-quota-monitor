@@ -76,7 +76,8 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     # EventBridge invocation never does. Only the schedule is allowed to run the
     # expensive resource-map crawl and write to S3. The public API path is
     # strictly read-only so an unauthenticated caller cannot drive the crawl or
-    # S3 writes (see the security note on DashboardApi in template.yaml).
+    # S3 writes (see the API Gateway security note in
+    # terraform/modules/live-refresh/apigateway.tf).
     is_api_request = "requestContext" in event
 
     if not is_api_request:
@@ -120,22 +121,35 @@ def _collect_snapshot(instance_id: str) -> dict[str, Any]:
     quotas = []
     for api_name in HIGH_TRAFFIC_APIS:
         usage = api_usage.get(api_name, 0)
-        limit = quota_limits.get(api_name, 2)  # Default TPS if not found
-        utilization = round(usage / limit * 100, 1) if limit > 0 else 0
-        headroom = round(limit - usage, 2)
+        limit = quota_limits.get(api_name)
+        if limit is not None and limit > 0:
+            utilization = round(usage / limit * 100, 1)
+            quotas.append({
+                "api": api_name,
+                "current_tps": round(usage, 2),
+                "limit_tps": limit,
+                "utilization_pct": utilization,
+                "headroom_tps": round(limit - usage, 2),
+                "status": "critical" if utilization > 85 else "warning" if utilization > 70 else "ok",
+            })
+        else:
+            # Limit unavailable (ServiceQuotas throttled/denied, or the quota is
+            # not registered). Do NOT invent a default limit -- that previously
+            # made every API read as critical during a ServiceQuotas outage.
+            # Report the usage with an explicit "unknown" status instead.
+            quotas.append({
+                "api": api_name,
+                "current_tps": round(usage, 2),
+                "limit_tps": None,
+                "utilization_pct": None,
+                "headroom_tps": None,
+                "status": "unknown",
+            })
 
-        quotas.append({
-            "api": api_name,
-            "current_tps": round(usage, 2),
-            "limit_tps": limit,
-            "utilization_pct": utilization,
-            "headroom_tps": headroom,
-            "status": "critical" if utilization > 85 else "warning" if utilization > 70 else "ok",
-        })
+    # Sort by utilization descending (highest risk first); unknown (None) last.
+    quotas.sort(key=lambda q: q["utilization_pct"] if q["utilization_pct"] is not None else -1.0, reverse=True)
 
-    # Sort by utilization descending (highest risk first)
-    quotas.sort(key=lambda q: q["utilization_pct"], reverse=True)
-
+    rated = [q for q in quotas if q["utilization_pct"] is not None]
     return {
         "timestamp": now.isoformat(),
         "instance_id": instance_id,
@@ -146,8 +160,9 @@ def _collect_snapshot(instance_id: str) -> dict[str, Any]:
             "critical": sum(1 for q in quotas if q["status"] == "critical"),
             "warning": sum(1 for q in quotas if q["status"] == "warning"),
             "ok": sum(1 for q in quotas if q["status"] == "ok"),
-            "highest_utilization_pct": quotas[0]["utilization_pct"] if quotas else 0,
-            "highest_utilization_api": quotas[0]["api"] if quotas else "none",
+            "unknown": sum(1 for q in quotas if q["status"] == "unknown"),
+            "highest_utilization_pct": rated[0]["utilization_pct"] if rated else 0,
+            "highest_utilization_api": rated[0]["api"] if rated else "none",
         },
     }
 
@@ -244,14 +259,20 @@ def _get_quota_limits(sq: Any) -> dict[str, float]:
         for page in paginator.paginate(ServiceCode=CONNECT_SERVICE_CODE):
             for quota in page.get("Quotas", []):
                 name = quota.get("QuotaName", "")
-                # Match "Rate of X API requests" pattern
+                # Match the exact "Rate of <API> API requests" quota name, not a
+                # substring. Substring matching mis-binds limits between distinct
+                # APIs whose names are prefixes of each other (e.g. "StopContact"
+                # is a substring of "StopContactStreaming"), which could show a
+                # breached quota as merely a warning. Anchor on the full name.
                 for api_name in HIGH_TRAFFIC_APIS:
-                    if api_name in name:
-                        # .get(key, default) only substitutes when the key is
-                        # absent, not when Value is explicitly null; coerce None
-                        # to the default so downstream arithmetic never sees None.
+                    if name == f"Rate of {api_name} API requests":
+                        # Only record a real, non-null limit. A null/absent value
+                        # means the limit is unknown; leave it out so the caller
+                        # renders "unknown" rather than substituting a wrong
+                        # default (which would paint everything critical).
                         value = quota.get("Value")
-                        limits[api_name] = value if value is not None else 2
+                        if value is not None:
+                            limits[api_name] = value
                         break
     except ClientError as e:
         logger.warning("ServiceQuotas query failed: %s", e)
@@ -553,6 +574,20 @@ def _generate_dashboard_html(snapshot: dict[str, Any]) -> str:
     quota_rows = ""
     for q in quotas:
         pct = q["utilization_pct"]
+        if pct is None:
+            # Limit unknown: render neutrally, never as a false critical.
+            limit_txt = q["limit_tps"] if q["limit_tps"] is not None else "unknown"
+            headroom_txt = q["headroom_tps"] if q["headroom_tps"] is not None else "&#8212;"
+            quota_rows += f"""<tr>
+<td style="font-weight:600">{q['api']}</td>
+<td style="text-align:right">{q['current_tps']}</td>
+<td style="text-align:right">{limit_txt}</td>
+<td><div style="background:#e9ebed;border-radius:4px;height:8px;width:120px;display:inline-block;vertical-align:middle"></div></td>
+<td style="color:#5f6b7a;text-align:right">&#8212;</td>
+<td style="text-align:right">{headroom_txt}</td>
+<td>{q['status']}</td>
+</tr>"""
+            continue
         color = "#d91515" if pct > 85 else "#d97706" if pct > 70 else "#037f0c"
         shape = "&#9632;" if pct > 85 else "&#9650;" if pct > 70 else "&#9679;"
         width = min(pct, 100)
